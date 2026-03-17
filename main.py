@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 from fetcher import get_session, fetch_screen
 from cleaner import clean_dataframe
 from config import SCREEN_1, SCREEN_2
+from scoring import score_mature, score_young
+import pandas as pd
+
 
 load_dotenv()
 
@@ -46,6 +49,24 @@ def run():
         print("\nScreen2 null check:")
         print(df2.isnull().sum().sort_values(ascending=False).head(10))
 
+# -------- Scoring --------
+def run_scoring():
+    # Screen 1: Mature Companies
+    df1 = pd.read_csv("output/screen1_clean.csv")
+    df1 = score_mature(df1)
+    df1 = df1.sort_values("final_score", ascending=False)
+    df1.to_csv("output/screen1_ranked.csv", index=False)
+    print("✓ Screen 1 (Mature) scoring complete")
+
+    # Screen 2: Young Companies
+    df2 = pd.read_csv("output/screen2_clean.csv")
+    df2 = score_young(df2)
+    df2 = df2.sort_values("final_score", ascending=False)
+    df2.to_csv("output/screen2_ranked.csv", index=False)
+    print("✓ Screen 2 (Young) scoring complete")
+
+
 
 if __name__ == "__main__":
-    run()
+    #run()
+    run_scoring()
