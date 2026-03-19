@@ -244,12 +244,35 @@ if __name__ == "__main__":
         WEIGHT_FUNDAMENTAL * matched_df["funda_score"]
     ).round(4)
     matched_df["market_condition"] = market_condition
+
+    # --- New IPO Tagging Logic ---
+    matched_df["ipo_status"] = ""
+    ipo_path = "output/ipo_lookup.csv"
+
+    if os.path.exists(ipo_path):
+        ipo_df = pd.read_csv(ipo_path)
+        print("  Checking for High QIB IPOs...")
+
+        for idx, row in matched_df.iterrows():
+            # Get the first word of the stock name (e.g., 'Zomato' from 'Zomato Ltd')
+            stock_first_word = str(row['stock_name']).split()[0].upper()
+            
+            # Look for a match in the IPO table (if company_name contains first word)
+            match = ipo_df[ipo_df['company_name'].str.upper().str.contains(stock_first_word, na=False)]
+            
+            if not match.empty:
+                qib_val = match.iloc[0]['qib_subscription']
+                if qib_val > 25:
+                    matched_df.at[idx, "ipo_status"] = f"🚀 IPO (QIB: {qib_val}x)"
+                    print(f"  ✦ {row['symbol']:12} matched recent high-demand IPO!")
+    # -----------------------------
+
     matched_df = matched_df.sort_values("final_score", ascending=False)
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
-    print("Top 15:")
+    print("\nTop 15:")
     display_cols = ["symbol", "stock_name", "final_score",
-                    "tech_score", "funda_score", "priority"]
+                    "tech_score", "funda_score", "priority", "ipo_status"]
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
 

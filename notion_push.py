@@ -36,8 +36,16 @@ def build_summary(row):
     debt_eq     = safe_str(row.get("Debt / Eq", ""))
     promoter    = safe_str(row.get("Prom. Hold.%", ""))
     close       = safe_str(row.get("close", ""))
+    ipo_status  = safe_str(row.get("ipo_status", ""))
 
-    lines = [
+    lines = []
+    
+    # Highlight IPO status at the top if present
+    if ipo_status:
+        lines.append(f"*** {ipo_status.upper()} ***")
+        lines.append("")
+
+    lines.extend([
         f"Final score: {round(final_score * 100, 1)}%",
         f"Technical: {round(tech_score * 100, 1)}% | Fundamental: {round(funda_score * 100, 1)}%",
         f"",
@@ -47,7 +55,7 @@ def build_summary(row):
         f"CMP: Rs.{close}",
         f"ROE: {roe}% | ROCE: {roce}%",
         f"D/E: {debt_eq} | Promoter: {promoter}%",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -56,9 +64,14 @@ def push_company(row, scan_date):
     symbol  = safe_str(row.get("symbol", ""))
     score   = safe_float(row.get("final_score", 0))
     market  = safe_str(row.get("market_condition", "UNKNOWN"))
+    ipo_tag = safe_str(row.get("ipo_status", ""))
+    
     title   = f"{symbol} — {name}"
     summary = build_summary(row)
     priority = safe_str(row.get("priority", "—"))[:100]
+
+    # Status logic: Flag high-demand IPOs or default to "To Review"
+    status_val = "High QIB IPO" if ipo_tag else "To Review"
 
     # check if already exists
     existing = notion.databases.query(
@@ -93,7 +106,7 @@ def push_company(row, scan_date):
             "rich_text": [{"text": {"content": summary[:2000]}}]
         },
         "Status": {
-            "select": {"name": "To Review"}
+            "select": {"name": status_val}
         },
         "Scan Date": {
             "date": {"start": scan_date}
