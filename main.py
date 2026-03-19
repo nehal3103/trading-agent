@@ -276,6 +276,39 @@ if __name__ == "__main__":
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
 
+    # ... inside main.py, after Step 5 (Scoring) ...
+
+    import news_analyzer
+    import math
+
+    # ... after your DataFrame 'matched_df' is ready ...
+
+    print(f"=== Starting 2026 AI Analysis for {len(matched_df)} stocks ===")
+
+    # 1. First, fetch all the news (this doesn't hit AI limits)
+    all_news_data = []
+    for idx, row in matched_df.iterrows():
+        news_text = news_analyzer.get_realtime_announcements(row['symbol'])
+        all_news_data.append({"symbol": row['symbol'], "news": news_text})
+
+    # 2. Process in batches of 5
+    batch_size = 5
+    final_results = {}
+
+    for i in range(0, len(all_news_data), batch_size):
+        batch = all_news_data[i : i + batch_size]
+        print(f"  Processing Batch {math.ceil((i+1)/batch_size)}...")
+
+        # Single AI call for 5 stocks
+        batch_output = news_analyzer.analyze_stock_batch(batch)
+
+        # Store results (Basic logic: you can refine the parsing later)
+        for item in batch:
+            final_results[item['symbol']] = batch_output
+
+    # 3. Save back to DataFrame
+    matched_df['ai_analysis'] = matched_df['symbol'].map(final_results)
+
     # step 6 — notion push
     push_to_notion(market_condition=market_condition, ranked_df=matched_df)
 
