@@ -240,7 +240,7 @@ def push_company(row, scan_date):
         row.get("ai_narrative", {})
     )
 
-    # Check if AI analysis is actually available
+    # Determine whether AI data is usable; if not, skip AI properties so existing row values stay as-is
     ai_data = row.get("ai_narrative", {})
     if isinstance(ai_data, str):
         try:
@@ -248,15 +248,10 @@ def push_company(row, scan_date):
             ai_data = json.loads(ai_data)
         except:
             ai_data = {}
-    
+
     ai_available = is_ai_analysis_available(ai_data)
-    
-    # If AI analysis is not available, use placeholder values
     if not ai_available:
-        red_flags = "—"
-        catalysts = "—"
-        verdict = "Neutral"
-        print(f"  [AI] {symbol} — using placeholders (no valid analysis)")
+        print(f"  [AI] {symbol} — analysis unavailable; not updating Red Flags/Catalysts/Verdict")
 
     verdict_clean = "Neutral"
     if "bullish" in verdict.lower():
@@ -296,15 +291,6 @@ def push_company(row, scan_date):
         "Fundamentals": {
             "rich_text": [{"text": {"content": fundamentals[:2000]}}]
         },
-        "Red Flags": {
-            "rich_text": [{"text": {"content": red_flags[:2000]}}]
-        },
-        "Catalysts": {
-            "rich_text": [{"text": {"content": catalysts[:2000]}}]
-        },
-        "Verdict": {
-            "select": {"name": verdict_clean}
-        },
         "IPO": {
             "select": {"name": ipo_label[:100]}
         },
@@ -318,6 +304,19 @@ def push_company(row, scan_date):
             "rich_text": [{"text": {"content": ""}}]
         },
     }
+
+    # Preserve previous AI fields on update if no new valid AI output
+    if ai_available:
+        properties["Red Flags"] = {
+            "rich_text": [{"text": {"content": red_flags[:2000]}}]
+        }
+        properties["Catalysts"] = {
+            "rich_text": [{"text": {"content": catalysts[:2000]}}]
+        }
+        properties["Verdict"] = {
+            "select": {"name": verdict_clean}
+        }
+
     if existing["results"]:
         page_id = existing["results"][0]["id"]
         notion.pages.update(page_id=page_id, properties=properties)
