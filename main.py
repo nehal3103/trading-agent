@@ -1,6 +1,7 @@
 import os
 import time
 import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 
 from fetcher import get_session, fetch_screen
@@ -17,19 +18,49 @@ PASSWORD = os.getenv("SCREENER_PASSWORD")
 
 os.makedirs("output", exist_ok=True)
 
-# strict stop words — keep 'india' so 'Engineers India' doesnt match 'Rajoo Engineers'
 STOP_WORDS = {
     "limited", "ltd", "ltd.", "and", "of", "the", "for",
     "corporation", "corp", "co",
 }
 
-# keywords to filter out ETFs and index funds from Chartink
 ETF_KEYWORDS = ["ETF", "BEES", "LIQUID", "SDL", "CPSE", "GOLDBEES",
                 "NIFTYBEES", "JUNIORBEES", "BANKBEES"]
 
 
 # ─────────────────────────────────────────────
-# LOAD NSE REFERENCE
+# SCREENER GATE CACHE
+# ─────────────────────────────────────────────
+def load_gate_screen_cached(session):
+    """
+    Loads the Screener gate screen with daily caching.
+    First run fetches from Screener and caches.
+    Subsequent runs the same day load from cache instantly.
+    """
+    cache_path = "output/gate_screen_cache.csv"
+    meta_path  = "output/gate_screen_cache_date.txt"
+    today      = datetime.now().strftime("%Y-%m-%d")
+
+    if os.path.exists(cache_path) and os.path.exists(meta_path):
+        cached_date = open(meta_path).read().strip()
+        if cached_date == today:
+            df = pd.read_csv(cache_path)
+            print(f"✓ Gate screen loaded from cache — {len(df)} companies")
+            return df
+
+    print("  Cache miss — fetching gate screen from Screener...")
+    raw_df = fetch_screen(session, GATE_SCREEN["id"], GATE_SCREEN["slug"])
+    if raw_df is None:
+        return None
+
+    gate_df = clean_dataframe(raw_df)
+    gate_df.to_csv(cache_path, index=False)
+    open(meta_path, "w").write(today)
+    print(f"✓ Gate screen fetched and cached — {len(gate_df)} companies")
+    return gate_df
+
+
+# ─────────────────────────────────────────────
+# NSE REFERENCE
 # ─────────────────────────────────────────────
 def load_nse_reference():
     path = "nse_symbols.csv"
@@ -44,9 +75,6 @@ def load_nse_reference():
     return df
 
 
-# ─────────────────────────────────────────────
-# GET 2-WORD SEARCH KEY FROM NSE NAME
-# ─────────────────────────────────────────────
 def get_search_key(symbol, nse_df):
     if nse_df is None:
         return None
@@ -144,7 +172,6 @@ if __name__ == "__main__":
         print("✗ No Chartink data — put CSVs in chartink_exports/ and retry")
         exit(0)
 
-    # filter out ETFs and index funds
     before = len(chartink_df)
     chartink_df = chartink_df[
         ~chartink_df["symbol"].str.upper().str.contains(
@@ -159,29 +186,27 @@ if __name__ == "__main__":
     chartink_df.to_csv("output/chartink_combined.csv", index=False)
     print(f"Total stocks after ETF filter: {len(chartink_df)}\n")
 
-    # step 3 — fundamental gate screen
+    # step 3 — fundamental gate screen (cached)
     print("=== Fundamental Gate Screen ===\n")
     session = get_session(EMAIL, PASSWORD)
     if not session:
         print("✗ Could not log into Screener")
         exit(0)
 
-    raw_df = fetch_screen(session, GATE_SCREEN["id"], GATE_SCREEN["slug"])
-    if raw_df is None:
+    gate_df = load_gate_screen_cached(session)
+    if gate_df is None:
         print("✗ Could not fetch gate screen")
         exit(0)
 
-    gate_df = clean_dataframe(raw_df)
     gate_df.to_csv("output/gate_screen_clean.csv", index=False)
-    print(f"✓ Gate screen — {len(gate_df)} companies\n")
     gate_df["Name_upper"] = gate_df["Name"].str.strip().str.upper()
+    print()
 
     # step 4 — intersection
     print("=== Intersection — Chartink ∩ Screener ===\n")
     nse_df = load_nse_reference()
 
     matched_rows = []
-
     for _, c_row in chartink_df.iterrows():
         c_symbol     = str(c_row["symbol"]).strip().upper()
         c_stock_name = str(c_row["stock_name"]).strip()
@@ -189,9 +214,8 @@ if __name__ == "__main__":
         search_key = get_search_key(c_symbol, nse_df)
 
         if not search_key:
-            # fallback to Chartink name
             words = c_stock_name.upper().split()
-            sig = []
+            sig   = []
             for w in words:
                 clean = w.lower().strip(".,&()")
                 if clean not in STOP_WORDS and len(clean) >= 3:
@@ -204,9 +228,8 @@ if __name__ == "__main__":
             print(f"  ✗ {c_symbol:12} → no search key")
             continue
 
-        # require ALL words in search key to match
         search_words = search_key.split()
-        match = gate_df.copy()
+        match        = gate_df.copy()
         for word in search_words:
             match = match[
                 match["Name_upper"].str.contains(word.upper(), na=False)
@@ -228,7 +251,6 @@ if __name__ == "__main__":
             print(f"  ✗ {c_symbol:12} → not in Screener gate")
 
     print(f"\n  {len(matched_rows)} stocks matched\n")
-
     if not matched_rows:
         print("✗ No matches found")
         exit(0)
@@ -244,70 +266,24 @@ if __name__ == "__main__":
         WEIGHT_FUNDAMENTAL * matched_df["funda_score"]
     ).round(4)
     matched_df["market_condition"] = market_condition
-
-    # --- New IPO Tagging Logic ---
-    matched_df["ipo_status"] = ""
-    ipo_path = "output/ipo_lookup.csv"
-
-    if os.path.exists(ipo_path):
-        ipo_df = pd.read_csv(ipo_path)
-        print("  Checking for High QIB IPOs...")
-
-        for idx, row in matched_df.iterrows():
-            # Get the first word of the stock name (e.g., 'Zomato' from 'Zomato Ltd')
-            stock_first_word = str(row['stock_name']).split()[0].upper()
-            
-            # Look for a match in the IPO table (if company_name contains first word)
-            match = ipo_df[ipo_df['company_name'].str.upper().str.contains(stock_first_word, na=False)]
-            
-            if not match.empty:
-                qib_val = match.iloc[0]['qib_subscription']
-                if qib_val > 25:
-                    matched_df.at[idx, "ipo_status"] = f"🚀 IPO (QIB: {qib_val}x)"
-                    print(f"  ✦ {row['symbol']:12} matched recent high-demand IPO!")
-    # -----------------------------
-
     matched_df = matched_df.sort_values("final_score", ascending=False)
-    matched_df.to_csv("output/final_ranked.csv", index=False)
 
-    print("\nTop 15:")
+    print("Top 15:")
     display_cols = ["symbol", "stock_name", "final_score",
-                    "tech_score", "funda_score", "priority", "ipo_status"]
+                    "tech_score", "funda_score", "priority"]
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
 
-    # ... inside main.py, after Step 5 (Scoring) ...
+    # step 5b — news analysis (batched, cached, Gemini)
+    print()
+    from news_analyzer import run_news_analysis
+    symbols_to_analyse = matched_df["symbol"].tolist()
+    ai_results         = run_news_analysis(symbols_to_analyse, batch_size=5)
+    matched_df["ai_narrative"] = matched_df["symbol"].map(ai_results).fillna(
+        "No announcements found — check manually"
+    )
 
-    import news_analyzer
-    import math
-
-    # ... after your DataFrame 'matched_df' is ready ...
-
-    print(f"=== Starting 2026 AI Analysis for {len(matched_df)} stocks ===")
-
-    # 1. First, fetch all the news (this doesn't hit AI limits)
-    all_news_data = []
-    for idx, row in matched_df.iterrows():
-        news_text = news_analyzer.get_realtime_announcements(row['symbol'])
-        all_news_data.append({"symbol": row['symbol'], "news": news_text})
-
-    # 2. Process in batches of 5
-    batch_size = 5
-    final_results = {}
-
-    for i in range(0, len(all_news_data), batch_size):
-        batch = all_news_data[i : i + batch_size]
-        print(f"  Processing Batch {math.ceil((i+1)/batch_size)}...")
-
-        # Single AI call for 5 stocks
-        batch_output = news_analyzer.analyze_stock_batch(batch)
-
-        # Store results (Basic logic: you can refine the parsing later)
-        for item in batch:
-            final_results[item['symbol']] = batch_output
-
-    # 3. Save back to DataFrame
-    matched_df['ai_analysis'] = matched_df['symbol'].map(final_results)
+    matched_df.to_csv("output/final_ranked.csv", index=False)
 
     # step 6 — notion push
     push_to_notion(market_condition=market_condition, ranked_df=matched_df)
