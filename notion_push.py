@@ -26,32 +26,66 @@ def safe_str(val):
 
 
 def parse_ai_narrative(narrative):
+    import json
+    import ast
+
+    if narrative is None or (isinstance(narrative, float) and pd.isna(narrative)):
+        return "None", "None", "Neutral"
+
     if isinstance(narrative, dict):
         return (
-            narrative.get("red_flags", "None"),
-            narrative.get("catalysts", "None"),
-            narrative.get("verdict", "Neutral")
+            str(narrative.get("red_flags", "None")).strip() or "None",
+            str(narrative.get("catalysts", "None")).strip() or "None",
+            str(narrative.get("verdict", "Neutral")).strip() or "Neutral"
         )
-    narrative = str(narrative)
+
+    text = str(narrative).strip()
+
+    # Try JSON parsing
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return (
+                str(data.get("red_flags", "None")).strip() or "None",
+                str(data.get("catalysts", "None")).strip() or "None",
+                str(data.get("verdict", "Neutral")).strip() or "Neutral"
+            )
+    except Exception:
+        pass
+
+    # Try Python literal dict (as may be saved from dict string in CSV)
+    try:
+        data = ast.literal_eval(text)
+        if isinstance(data, dict):
+            return (
+                str(data.get("red_flags", "None")).strip() or "None",
+                str(data.get("catalysts", "None")).strip() or "None",
+                str(data.get("verdict", "Neutral")).strip() or "Neutral"
+            )
+    except Exception:
+        pass
+
+    # Fallback parse manually from simple text
     red_flags = "None"
     catalysts = "None"
     verdict   = "Neutral"
-    for line in narrative.split("\n"):
+
+    for line in text.split("\n"):
         line = line.strip()
-        if line.startswith("RED FLAGS:") or line.startswith("RED_FLAGS:"):
-            red_flags = line.split(":", 1)[1].strip()
-        elif line.startswith("CATALYSTS:"):
-            catalysts = line.split(":", 1)[1].strip()
-        elif line.startswith("VERDICT:"):
-            verdict = line.split(":", 1)[1].strip()
-    return red_flags, catalysts, verdict
+        if line.upper().startswith("RED FLAGS:") or line.upper().startswith("RED_FLAGS:"):
+            acl = line.split(":", 1)
+            red_flags = acl[1].strip() if len(acl) > 1 else "None"
+        elif line.upper().startswith("CATALYSTS:"):
+            acl = line.split(":", 1)
+            catalysts = acl[1].strip() if len(acl) > 1 else "None"
+        elif line.upper().startswith("VERDICT:"):
+            acl = line.split(":", 1)
+            verdict = acl[1].strip() if len(acl) > 1 else "Neutral"
+
+    return red_flags or "None", catalysts or "None", verdict or "Neutral"
 
 
 def build_screen_label(row):
-    """
-    Shows both priority label and scanner names.
-    e.g. "A — Coal India (stage2 + growthstocks + buying_urgency)"
-    """
     priority = safe_str(row.get("priority", "—"))
     scanners = safe_str(row.get("scanners", ""))
     if scanners:
@@ -60,22 +94,43 @@ def build_screen_label(row):
 
 
 def get_ipo_label(row):
-    """Returns IPO label if stock has high QIB, else —"""
     ipo_path = "output/ipo_lookup.csv"
     try:
         if not os.path.exists(ipo_path):
             return "—"
+
         ipo_df     = pd.read_csv(ipo_path)
         stock_name = safe_str(row.get("stock_name", ""))
-        first_word = stock_name.split()[0].upper() if stock_name else ""
-        if not first_word:
+        if not stock_name:
             return "—"
-        match = ipo_df[
-            ipo_df["company_name"].str.upper().str.contains(first_word, na=False)
-        ]
-        if not match.empty and match.iloc[0]["qib_subscription"] > 25:
-            qib = match.iloc[0]["qib_subscription"]
-            return f"High QIB ({qib}x)"
+
+        # stop words — too generic to match on
+        stop = {"ltd", "limited", "india", "indian", "and", "of",
+                "the", "co", "corp", "corporation"}
+
+        def sig_words(name):
+            words = str(name).lower().replace(".", "").replace("-", " ").split()
+            return [w for w in words if w not in stop and len(w) >= 3][:2]
+
+        stock_sig = sig_words(stock_name)
+        if not stock_sig:
+            return "—"
+
+        for _, ipo_row in ipo_df.iterrows():
+            ipo_sig = sig_words(ipo_row["company_name"])
+            if not ipo_sig:
+                continue
+            # first significant word must match exactly
+            if stock_sig[0] != ipo_sig[0]:
+                continue
+            # if both have 2 words, second must also match
+            if len(stock_sig) >= 2 and len(ipo_sig) >= 2:
+                if stock_sig[1] != ipo_sig[1]:
+                    continue
+            qib = ipo_row["qib_subscription"]
+            if qib > 25:
+                return f"High QIB ({round(float(qib), 1)}x)"
+
     except Exception:
         pass
     return "—"
@@ -143,6 +198,34 @@ def build_fundamentals(row):
     return "\n".join(str(l) for l in lines)
 
 
+def is_ai_analysis_available(analysis_dict):
+    """Check if AI analysis contains real data vs error messages"""
+    if not analysis_dict or not isinstance(analysis_dict, dict):
+        return False
+        
+    bad_indicators = [
+        "Analysis unavailable",
+        "No data available", 
+        "Error",
+        "Failed",
+        "Token expired",
+        "API error"
+    ]
+    
+    red_flags = str(analysis_dict.get("red_flags", "")).lower().strip()
+    catalysts = str(analysis_dict.get("catalysts", "")).lower().strip()
+    
+    # Check if any field indicates an error
+    if any(indicator.lower() in red_flags for indicator in bad_indicators) or \
+       any(indicator.lower() in catalysts for indicator in bad_indicators):
+        return False
+        
+    # Check if we have at least some meaningful content
+    return not (red_flags in ["none", ""] and 
+                catalysts in ["none", ""] and 
+                str(analysis_dict.get("verdict", "")).lower().strip() == "neutral")
+
+
 def push_company(row, scan_date):
     name     = safe_str(row.get("stock_name", "Unknown"))
     symbol   = safe_str(row.get("symbol", ""))
@@ -157,6 +240,24 @@ def push_company(row, scan_date):
         row.get("ai_narrative", {})
     )
 
+    # Check if AI analysis is actually available
+    ai_data = row.get("ai_narrative", {})
+    if isinstance(ai_data, str):
+        try:
+            import json
+            ai_data = json.loads(ai_data)
+        except:
+            ai_data = {}
+    
+    ai_available = is_ai_analysis_available(ai_data)
+    
+    # If AI analysis is not available, use placeholder values
+    if not ai_available:
+        red_flags = "—"
+        catalysts = "—"
+        verdict = "Neutral"
+        print(f"  [AI] {symbol} — using placeholders (no valid analysis)")
+
     verdict_clean = "Neutral"
     if "bullish" in verdict.lower():
         verdict_clean = "Bullish"
@@ -164,12 +265,6 @@ def push_company(row, scan_date):
         verdict_clean = "Bearish"
 
     fundamentals = build_fundamentals(row)
-
-    # only update AI Summary if we have real analysis
-    # if quota was exhausted this preserves existing Notion data
-    has_real_analysis = (
-        red_flags not in ('Analysis unavailable', 'None', '')
-    )
 
     existing = notion.databases.query(
         database_id=NOTION_DATABASE_ID,
@@ -219,17 +314,10 @@ def push_company(row, scan_date):
         "Scan Date": {
             "date": {"start": scan_date}
         },
-        "Your TA Notes": {
+        "Notes": {
             "rich_text": [{"text": {"content": ""}}]
         },
     }
-
-    # conditionally add AI Summary — only if real analysis available
-    if has_real_analysis:
-        properties["AI Summary"] = {
-            "rich_text": [{"text": {"content": f"Red Flags: {red_flags}Catalysts: {catalysts}Verdict: {verdict_clean}"[:2000]}}]
-        }
-
     if existing["results"]:
         page_id = existing["results"][0]["id"]
         notion.pages.update(page_id=page_id, properties=properties)

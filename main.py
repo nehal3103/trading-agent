@@ -1,5 +1,4 @@
 import os
-import time
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
@@ -31,11 +30,6 @@ ETF_KEYWORDS = ["ETF", "BEES", "LIQUID", "SDL", "CPSE", "GOLDBEES",
 # SCREENER GATE CACHE
 # ─────────────────────────────────────────────
 def load_gate_screen_cached(session):
-    """
-    Loads the Screener gate screen with daily caching.
-    First run fetches from Screener and caches.
-    Subsequent runs the same day load from cache instantly.
-    """
     cache_path = "output/gate_screen_cache.csv"
     meta_path  = "output/gate_screen_cache_date.txt"
     today      = datetime.now().strftime("%Y-%m-%d")
@@ -274,14 +268,70 @@ if __name__ == "__main__":
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
 
-    # step 5b — news analysis (batched, cached, Gemini)
+    # step 5b — news analysis (web search via Groq compound)
     print()
-    from news_analyzer import run_news_analysis
-    symbols_to_analyse = matched_df["symbol"].tolist()
-    ai_results         = run_news_analysis(symbols_to_analyse, batch_size=5)
-    matched_df["ai_narrative"] = matched_df["symbol"].map(ai_results).fillna(
-        "No announcements found — check manually"
-    )
+    try:
+        from news_analyzer import run_news_analysis
+        import json
+        symbols_to_analyse = matched_df["symbol"].tolist()
+        ai_results         = run_news_analysis(symbols_to_analyse)
+
+        # Debug: check what we got back
+        print("\n  DEBUG — AI Results Summary:")
+        for sym, data in list(ai_results.items())[:3]:  # Show first 3
+            print(f"    {sym}: red_flags={data.get('red_flags', 'MISSING')[:50]}... catalysts={data.get('catalysts', 'MISSING')[:50]}...")
+        print(f"    Total symbols analyzed: {len(ai_results)}")
+
+        # Create ai_narrative with proper defaults and serialize to JSON
+        def get_ai_data(symbol):
+            symbol_str = str(symbol).strip().upper()
+            # Try exact match first, then case-insensitive
+            if symbol_str in ai_results:
+                data = ai_results[symbol_str]
+            else:
+                # Fallback search
+                data = None
+                for key in ai_results.keys():
+                    if str(key).strip().upper() == symbol_str:
+                        data = ai_results[key]
+                        break
+                if data is None:
+                    data = {
+                        "red_flags": "No data available",
+                        "catalysts": "No data available",
+                        "verdict": "Neutral"
+                    }
+            return json.dumps(data)
+        
+        matched_df["ai_narrative"] = matched_df["symbol"].apply(get_ai_data)
+        
+        # Debug: verify the data in the DataFrame
+        if len(matched_df) > 0:
+            first_sym = matched_df.iloc[0]["symbol"]
+            first_narrative = matched_df.iloc[0]["ai_narrative"]
+            print(f"\n  DEBUG — First row in DataFrame:")
+            print(f"    Symbol: {first_sym}")
+            print(f"    ai_narrative (raw): {first_narrative[:200]}")
+            # Try to parse it back
+            try:
+                parsed = json.loads(first_narrative)
+                print(f"    Parsed red_flags: {parsed.get('red_flags', 'MISSING')}")
+                print(f"    Parsed catalysts: {parsed.get('catalysts', 'MISSING')}")
+            except Exception as e:
+                print(f"    ✗ Failed to parse: {e}")
+
+    except Exception as e:
+        print(f"  ⚠ AI analysis failed: {e}")
+        print("  Continuing with placeholder AI data...")
+        # Create placeholder AI data for all stocks
+        placeholder = json.dumps({
+            "red_flags": "Analysis failed",
+            "catalysts": "Analysis failed", 
+            "verdict": "Neutral"
+        })
+        matched_df["ai_narrative"] = placeholder
+
+    matched_df.to_csv("output/final_ranked.csv", index=False)
 
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
