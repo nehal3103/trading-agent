@@ -1,9 +1,11 @@
 import os
 import json
 import time
+import argparse
 import warnings
 import logging
 import requests
+import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -633,13 +635,50 @@ def run_news_analysis(symbols, batch_size=3, screener_session=None):
     return final_results
 
 
-if __name__ == "__main__":
-    test    = ["QPOWER", "CGPOWER", "COALINDIA"]
-    results = run_news_analysis(test)
+def load_symbols_from_csv(path):
+    if not os.path.exists(path):
+        print(f"✗ Symbols CSV not found: {path}")
+        return []
 
-    for sym, analysis in results.items():
-        print(f"\n{'='*40}")
-        print(f"{sym}:")
-        print(f"  Red Flags : {analysis['red_flags']}")
-        print(f"  Catalysts : {analysis['catalysts']}")
-        print(f"  Verdict   : {analysis['verdict']}")
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"✗ Could not read symbols CSV {path}: {e}")
+        return []
+
+    if "symbol" not in df.columns:
+        print(f"✗ CSV missing 'symbol' column: {path}")
+        return []
+
+    symbols = (
+        df["symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    symbols = [sym for sym in symbols.tolist() if sym and sym != "NAN"]
+    deduped = list(dict.fromkeys(symbols))
+    print(f"Loaded {len(deduped)} tracked symbols from {path}")
+    return deduped
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run news cache update and AI analysis for tracked symbols."
+    )
+    parser.add_argument(
+        "--symbols-csv",
+        default="output/tracked_symbols.csv",
+        help="CSV with a 'symbol' column used to determine tracked symbols.",
+    )
+    args = parser.parse_args()
+
+    symbols = load_symbols_from_csv(args.symbols_csv)
+    if not symbols:
+        raise SystemExit(1)
+
+    run_news_analysis(symbols)
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from ipo_fetcher import OUTPUT_PATH, load_ipo_csvs
+from main import run_pipeline
+from news_analyzer import load_symbols_from_csv, run_news_analysis
 from notion_push import retry_failed_from_last_run
 from reliability_utils import cache_read_enveloped
 
@@ -72,6 +75,33 @@ def cleanup_output(max_files=30):
     print(f"Cleanup complete: archived={archived}, deleted={deleted}")
 
 
+def refresh_ipo_lookup(output_path=OUTPUT_PATH):
+    df = load_ipo_csvs()
+    if df is None or df.empty:
+        print("✗ No IPO data available to build lookup.")
+        return 1
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"✓ IPO lookup refreshed: {out}")
+    return 0
+
+
+def daily_news_refresh(symbols_csv="output/tracked_symbols.csv"):
+    symbols = load_symbols_from_csv(symbols_csv)
+    if not symbols:
+        return 1
+
+    run_news_analysis(symbols)
+    return 0
+
+
+def weekly_pipeline():
+    report = run_pipeline()
+    return 0 if report.get("status") == "completed" else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Operational reliability helper commands.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -95,6 +125,29 @@ def main():
             0
         )[1]
     )
+
+    p_news = sub.add_parser(
+        "daily-news-refresh",
+        help="Update daily NSE announcement cache and incremental AI for tracked symbols",
+    )
+    p_news.add_argument(
+        "--symbols-csv",
+        default="output/tracked_symbols.csv",
+        help="CSV containing tracked symbols from the latest weekly run",
+    )
+    p_news.set_defaults(func=lambda args: daily_news_refresh(symbols_csv=args.symbols_csv))
+
+    p_ipo = sub.add_parser(
+        "refresh-ipo-lookup",
+        help="Rebuild output/ipo_lookup.csv from ipo_data/*.csv",
+    )
+    p_ipo.set_defaults(func=lambda args: refresh_ipo_lookup())
+
+    p_weekly = sub.add_parser(
+        "weekly-pipeline",
+        help="Run the full weekly trading pipeline",
+    )
+    p_weekly.set_defaults(func=lambda args: weekly_pipeline())
 
     args = parser.parse_args()
     code = args.func(args)

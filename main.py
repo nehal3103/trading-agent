@@ -18,6 +18,7 @@ EMAIL    = os.getenv("SCREENER_EMAIL")
 PASSWORD = os.getenv("SCREENER_PASSWORD")
 
 os.makedirs("output", exist_ok=True)
+TRACKED_SYMBOLS_PATH = "output/tracked_symbols.csv"
 
 STOP_WORDS = {
     "limited", "ltd", "ltd.", "and", "of", "the", "for",
@@ -163,7 +164,7 @@ def score_fundamentals(row):
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-if __name__ == "__main__":
+def run_pipeline():
     print("=== Trading Agent — Full Pipeline ===\n")
     run_report = {
         "started_at": datetime.now().isoformat(),
@@ -203,7 +204,7 @@ if __name__ == "__main__":
         run_report["finished_at"] = datetime.now().isoformat()
         write_json("output/run_report.json", run_report)
         print("✗ No Chartink data — put CSVs in chartink_exports/ and retry")
-        exit(0)
+        return run_report
 
     before = len(chartink_df)
     chartink_df = chartink_df[
@@ -232,7 +233,7 @@ if __name__ == "__main__":
         run_report["finished_at"] = datetime.now().isoformat()
         write_json("output/run_report.json", run_report)
         print("✗ Could not log into Screener")
-        exit(0)
+        return run_report
 
     gate_df = load_gate_screen_cached(session)
     if gate_df is None:
@@ -241,7 +242,7 @@ if __name__ == "__main__":
         run_report["finished_at"] = datetime.now().isoformat()
         write_json("output/run_report.json", run_report)
         print("✗ Could not fetch gate screen")
-        exit(0)
+        return run_report
     run_report["steps"]["fundamental_gate"] = {"status": "ok", "rows": int(len(gate_df))}
 
     gate_df.to_csv("output/gate_screen_clean.csv", index=False)
@@ -303,7 +304,7 @@ if __name__ == "__main__":
         run_report["finished_at"] = datetime.now().isoformat()
         write_json("output/run_report.json", run_report)
         print("✗ No matches found")
-        exit(0)
+        return run_report
     run_report["steps"]["intersection"] = {"status": "ok", "matched_rows": int(len(matched_rows))}
 
     matched_df = pd.DataFrame(matched_rows)
@@ -318,6 +319,13 @@ if __name__ == "__main__":
     ).round(4)
     matched_df["market_condition"] = market_condition
     matched_df = matched_df.sort_values("final_score", ascending=False)
+
+    tracked_cols = ["symbol", "stock_name", "scanner_count", "scanners", "priority"]
+    tracked_cols = [c for c in tracked_cols if c in matched_df.columns]
+    matched_df[tracked_cols].drop_duplicates(subset=["symbol"]).to_csv(
+        TRACKED_SYMBOLS_PATH,
+        index=False
+    )
 
     print("Top 15:")
     display_cols = ["symbol", "stock_name", "final_score",
@@ -405,8 +413,6 @@ if __name__ == "__main__":
 
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
-    matched_df.to_csv("output/final_ranked.csv", index=False)
-
     # step 6 — notion push
     try:
         push_stats = push_to_notion(market_condition=market_condition, ranked_df=matched_df)
@@ -420,3 +426,8 @@ if __name__ == "__main__":
     write_json("output/run_report.json", run_report)
     print(f"\n✓ Pipeline complete — {len(matched_df)} companies")
     print(f"  Market condition: {market_condition}")
+    return run_report
+
+
+if __name__ == "__main__":
+    run_pipeline()
