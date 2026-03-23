@@ -8,6 +8,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
+from reliability_utils import (
+    cache_read_enveloped,
+    cache_write_enveloped,
+    stable_hash_text,
+)
 
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
@@ -24,6 +29,7 @@ for d in [NSE_COOKIE_DIR, NSE_CACHE_DIR, AI_CACHE_DIR]:
 
 GROQ_MODEL = "groq/compound"
 MAX_ANNOUNCEMENTS_FOR_PROMPT = 5
+AI_RETRY_BUDGET = 3
 
 IMPORTANT_TYPES = {
     "order", "contract", "bagging", "award", "win",
@@ -74,15 +80,15 @@ def update_nse_cache(symbol):
     today_str  = datetime.now().strftime("%Y-%m-%d")
 
     cache = {"last_fetch": None, "items": []}
-    if cache_file.exists():
-        try:
-            loaded = json.loads(cache_file.read_text())
-            if "items" in loaded:
-                cache = loaded
-            elif "text" in loaded:
-                cache = {"last_fetch": None, "items": []}
-        except Exception:
-            pass
+    loaded, malformed = cache_read_enveloped(
+        cache_file,
+        expected_source="news_nse_cache",
+        default_data=cache
+    )
+    if malformed:
+        print(f"  ⚠ {symbol} NSE cache malformed; rebuilding")
+    if isinstance(loaded, dict):
+        cache = loaded
 
     last_fetch = cache.get("last_fetch")
     is_cached  = (last_fetch == today_str)
@@ -114,7 +120,7 @@ def update_nse_cache(symbol):
         cache["last_fetch"] = today_str
 
         try:
-            cache_file.write_text(json.dumps(cache))
+            cache_write_enveloped(cache_file, "news_nse_cache", cache)
         except Exception:
             pass
     else:
@@ -129,7 +135,13 @@ def get_important_announcements(symbol):
         return []
 
     try:
-        cache = json.loads(cache_file.read_text())
+        cache, malformed = cache_read_enveloped(
+            cache_file,
+            expected_source="news_nse_cache",
+            default_data={"items": []}
+        )
+        if malformed:
+            return []
         items = cache.get("items", [])
         important = [
             f"[{i['date'][:10]}] {i['desc']}"
@@ -147,7 +159,13 @@ def get_ai_analysis(symbol, max_age_days=30):
         return None
 
     try:
-        cached = json.loads(cache_file.read_text())
+        cached, malformed = cache_read_enveloped(
+            cache_file,
+            expected_source="news_ai_cache",
+            default_data={}
+        )
+        if malformed or not isinstance(cached, dict):
+            return None
         analysis = cached.get("analysis")
         cache_date = cached.get("date")
 
@@ -171,7 +189,7 @@ def get_ai_analysis(symbol, max_age_days=30):
         return None
 
 
-def save_ai_analysis(symbol, analysis_dict):
+def save_ai_analysis(symbol, analysis_dict, announcement_hash=None):
     # only cache real results — not failures or errors
     bad_indicators = [
         "Analysis unavailable",
@@ -201,10 +219,11 @@ def save_ai_analysis(symbol, analysis_dict):
     cache_file = AI_CACHE_DIR / f"{symbol}.json"
     today      = datetime.now().strftime("%Y-%m-%d")
     try:
-        cache_file.write_text(json.dumps({
+        cache_write_enveloped(cache_file, "news_ai_cache", {
             "date":     today,
-            "analysis": analysis_dict
-        }))
+            "analysis": analysis_dict,
+            "announcement_hash": announcement_hash
+        })
         print(f"    ✓ Cached analysis for {symbol}")
     except Exception as e:
         print(f"    ✗ Failed to cache {symbol}: {e}")
@@ -432,9 +451,12 @@ def analyze_stock(symbol, announcements):
     # Try full context first; only split if request hits 413.
     ann_text = _build_announcement_block(announcements, max_items=MAX_ANNOUNCEMENTS_FOR_PROMPT)
     prompt = _build_prompt(symbol, ann_text, compact=False)
-    for attempt in range(2):
+    telemetry = {"fallback_mode": "full", "chunks_used": 0}
+    for attempt in range(AI_RETRY_BUDGET):
         try:
-            return _analyze_with_prompt(symbol, prompt)
+            result = _analyze_with_prompt(symbol, prompt)
+            result["_telemetry"] = telemetry
+            return result
         except Exception as e:
             msg = str(e)
             if "429" in msg:
@@ -449,11 +471,13 @@ def analyze_stock(symbol, announcements):
             return {
                 "red_flags": "Analysis unavailable",
                 "catalysts": "Analysis unavailable",
-                "verdict": "Neutral"
+                "verdict": "Neutral",
+                "_telemetry": {"fallback_mode": "error", "chunks_used": 0}
             }
 
     # Split fallback: keep full announcement text per chunk, no pre-truncation.
     if announcements:
+        telemetry["fallback_mode"] = "split"
         chunks = [announcements[:3], announcements[3:5]]
         merged = {
             "red_flags": "None",
@@ -473,6 +497,7 @@ def analyze_stock(symbol, announcements):
                 if is_analysis_available(partial):
                     merged = merge_ai_analysis(merged, partial)
                     got_any = True
+                    telemetry["chunks_used"] += 1
             except Exception as e:
                 msg = str(e)
                 if "429" in msg:
@@ -491,12 +516,14 @@ def analyze_stock(symbol, announcements):
                     print(f"    Split chunk {idx} failed: {e}")
 
         if got_any:
+            merged["_telemetry"] = telemetry
             return merged
 
     return {
         "red_flags": "Analysis unavailable",
         "catalysts": "Analysis unavailable",
-        "verdict":   "Neutral"
+        "verdict":   "Neutral",
+        "_telemetry": {"fallback_mode": "failed", "chunks_used": 0}
     }
 
 
@@ -531,6 +558,22 @@ def run_news_analysis(symbols, batch_size=3, screener_session=None):
     if needs_analysis:
         print(f"\n  Running Groq compound (web search) for {len(needs_analysis)} stocks...")
         for i, symbol in enumerate(needs_analysis):
+            all_announcements = get_important_announcements(symbol)
+            announcement_hash = stable_hash_text("||".join(all_announcements))
+            cached_for_hash = get_ai_analysis(symbol)
+            if (
+                cached_for_hash is not None
+                and isinstance(cached_for_hash, dict)
+            ):
+                cached_payload, _ = cache_read_enveloped(
+                    AI_CACHE_DIR / f"{symbol}.json",
+                    expected_source="news_ai_cache",
+                    default_data={}
+                )
+                if cached_payload.get("announcement_hash") == announcement_hash:
+                    print(f"  [{i+1}/{len(needs_analysis)}] {symbol} (unchanged announcements; skip)")
+                    continue
+
             if symbol_updates[symbol]["updated"] and get_ai_analysis(symbol) is not None:
                 # incremental run only for new update block
                 new_announcements = [
@@ -547,12 +590,15 @@ def run_news_analysis(symbols, batch_size=3, screener_session=None):
                 analysis = incremental_ai_analysis(symbol, existing_analysis, new_announcements)
 
             else:
-                announcements = get_important_announcements(symbol)
+                announcements = all_announcements
                 print(f"  [{i+1}/{len(needs_analysis)}] {symbol} ({len(announcements)} announcements)")
                 analysis = analyze_stock(symbol, announcements)
 
             if is_analysis_available(analysis):
-                save_ai_analysis(symbol, analysis)
+                telemetry = analysis.pop("_telemetry", {})
+                if telemetry:
+                    print(f"    Telemetry: mode={telemetry.get('fallback_mode')} chunks={telemetry.get('chunks_used')}")
+                save_ai_analysis(symbol, analysis, announcement_hash=announcement_hash)
             else:
                 # if invalid result, keep old cache if any
                 old_cached = get_ai_analysis(symbol)

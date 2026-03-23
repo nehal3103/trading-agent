@@ -1,8 +1,11 @@
 import os
+import time
+import json
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from notion_client import Client
+from reliability_utils import write_json
 
 load_dotenv()
 
@@ -10,6 +13,7 @@ NOTION_TOKEN       = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 notion = Client(auth=NOTION_TOKEN)
+_DB_SCHEMA_CACHE = None
 
 
 def safe_float(val, decimals=2):
@@ -91,6 +95,53 @@ def build_screen_label(row):
     if scanners:
         return f"{priority} | {scanners}"
     return priority
+
+
+def notion_retry(callable_fn, retries=3, base_wait=1.5):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last_error = e
+            msg = str(e).lower()
+            transient = any(k in msg for k in ["timeout", "rate", "503", "429", "tempor"])
+            if not transient or attempt == retries - 1:
+                raise
+            time.sleep(base_wait * (attempt + 1))
+    raise last_error
+
+
+def get_database_schema():
+    global _DB_SCHEMA_CACHE
+    if _DB_SCHEMA_CACHE is not None:
+        return _DB_SCHEMA_CACHE
+    try:
+        db = notion_retry(lambda: notion.databases.retrieve(database_id=NOTION_DATABASE_ID))
+        _DB_SCHEMA_CACHE = db.get("properties", {})
+    except Exception:
+        _DB_SCHEMA_CACHE = {}
+    return _DB_SCHEMA_CACHE
+
+
+def safe_select_property(properties, prop_name, requested, fallback="Unknown"):
+    schema = get_database_schema()
+    prop = schema.get(prop_name, {})
+    options = (
+        prop.get("select", {}).get("options", [])
+        if isinstance(prop, dict)
+        else []
+    )
+    allowed = {o.get("name") for o in options if isinstance(o, dict)}
+    value = (requested or fallback or "Unknown").strip()[:100]
+    if allowed and value not in allowed:
+        if fallback in allowed:
+            value = fallback
+        elif "—" in allowed:
+            value = "—"
+        else:
+            value = next(iter(allowed))
+    properties[prop_name] = {"select": {"name": value}}
 
 
 def get_ipo_label(row):
@@ -266,42 +317,30 @@ def push_company(row, scan_date):
     nifty500_perf_1m = safe_float(row.get("nifty500_perf_1m", 0), 2)
     sector_vs_nifty500 = safe_float(row.get("sector_vs_nifty500", 0), 2)
 
-    existing = notion.databases.query(
+    existing = notion_retry(lambda: notion.databases.query(
         database_id=NOTION_DATABASE_ID,
         filter={
             "property": "Company",
             "title": {"equals": title}
         }
-    )
+    ))
 
     properties = {
         "Company": {
             "title": [{"text": {"content": title}}]
         },
-        "Screen": {
-            "select": {"name": screen_label}
-        },
+        "Screen": {},
         "Score": {
             "number": round(score * 100, 1)
         },
-        "Sector": {
-            "select": {"name": sector[:100]}
-        },
-        "Sector Strength": {
-            "select": {"name": sector_strength_label[:100]}
-        },
-        "Market Condition": {
-            "select": {"name": market}
-        },
+        "Sector": {},
+        "Sector Strength": {},
+        "Market Condition": {},
         "Fundamentals": {
             "rich_text": [{"text": {"content": fundamentals[:2000]}}]
         },
-        "IPO": {
-            "select": {"name": ipo_label[:100]}
-        },
-        "Status": {
-            "select": {"name": "To Review"}
-        },
+        "IPO": {},
+        "Status": {},
         "Scan Date": {
             "date": {"start": scan_date}
         },
@@ -317,6 +356,12 @@ def push_company(row, scan_date):
             }]
         },
     }
+    safe_select_property(properties, "Screen", screen_label, fallback="—")
+    safe_select_property(properties, "Sector", sector[:100], fallback="Unknown")
+    safe_select_property(properties, "Sector Strength", sector_strength_label[:100], fallback="Slightly Weak vs Nifty500")
+    safe_select_property(properties, "Market Condition", market, fallback="UNKNOWN")
+    safe_select_property(properties, "IPO", ipo_label[:100], fallback="—")
+    safe_select_property(properties, "Status", "To Review", fallback="To Review")
 
     # Preserve previous AI fields on update if no new valid AI output
     if ai_available:
@@ -329,16 +374,17 @@ def push_company(row, scan_date):
         properties["Verdict"] = {
             "select": {"name": verdict_clean}
         }
+        safe_select_property(properties, "Verdict", verdict_clean, fallback="Neutral")
 
     if existing["results"]:
         page_id = existing["results"][0]["id"]
-        notion.pages.update(page_id=page_id, properties=properties)
+        notion_retry(lambda: notion.pages.update(page_id=page_id, properties=properties))
         return "updated"
     else:
-        notion.pages.create(
+        notion_retry(lambda: notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
             properties=properties
-        )
+        ))
         return "created"
 
 
@@ -356,6 +402,7 @@ def push_to_notion(market_condition="UNKNOWN", ranked_df=None):
     total_created = 0
     total_updated = 0
     total_failed  = 0
+    failures = []
 
     for _, row in ranked_df.iterrows():
         symbol = safe_str(row.get("symbol", "Unknown"))
@@ -371,6 +418,7 @@ def push_to_notion(market_condition="UNKNOWN", ranked_df=None):
         except Exception as e:
             print(f"  ✗ {symbol} — {e}")
             total_failed += 1
+            failures.append({"symbol": symbol, "error": str(e)})
 
     print()
     print("─" * 40)
@@ -379,6 +427,40 @@ def push_to_notion(market_condition="UNKNOWN", ranked_df=None):
     print(f"  Failed  : {total_failed}")
     print("─" * 40)
     print(f"\n✓ Open Notion → Trading Candidates to review")
+
+    stats = {
+        "created": total_created,
+        "updated": total_updated,
+        "failed": total_failed,
+        "failed_rows": failures,
+        "scan_date": scan_date,
+    }
+    write_json("output/notion_last_run.json", stats)
+    return stats
+
+
+def retry_failed_from_last_run(market_condition="UNKNOWN", source_csv="output/final_ranked.csv"):
+    path = "output/notion_last_run.json"
+    if not os.path.exists(path):
+        print("✗ No previous Notion run report found.")
+        return None
+    with open(path, "r") as f:
+        data = json.load(f)
+    failed_rows = data.get("failed_rows", [])
+    if not failed_rows:
+        print("✓ No failed Notion rows to retry.")
+        return {"retried": 0, "failed": 0}
+    failed_symbols = {str(x.get("symbol", "")).strip().upper() for x in failed_rows}
+    if not os.path.exists(source_csv):
+        print(f"✗ Source CSV missing: {source_csv}")
+        return None
+    ranked_df = pd.read_csv(source_csv)
+    retry_df = ranked_df[ranked_df["symbol"].astype(str).str.upper().isin(failed_symbols)].copy()
+    if retry_df.empty:
+        print("✗ No matching symbols found for retry.")
+        return None
+    print(f"Retrying {len(retry_df)} failed symbols...")
+    return push_to_notion(market_condition=market_condition, ranked_df=retry_df)
 
 
 if __name__ == "__main__":

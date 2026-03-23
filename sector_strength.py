@@ -1,9 +1,9 @@
-import json
 from datetime import datetime
 from pathlib import Path
 
 import requests
 import yfinance as yf
+from reliability_utils import cache_read_enveloped, cache_write_enveloped
 
 
 SECTOR_CACHE_PATH = Path("output/sector_cache.json")
@@ -13,22 +13,23 @@ NSE_QUOTE_URL = "https://www.nseindia.com/api/quote-equity?symbol={symbol}"
 NIFTY_500_TICKER = "^CRSLDX"
 
 
-def _safe_json_load(path):
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return {}
-
-
 def _load_cache():
-    if not SECTOR_CACHE_PATH.exists():
+    data, malformed = cache_read_enveloped(
+        SECTOR_CACHE_PATH,
+        expected_source="sector_strength",
+        default_data={}
+    )
+    if malformed:
+        print("  ⚠ Sector cache malformed; rebuilding cache")
         return {}
-    return _safe_json_load(SECTOR_CACHE_PATH)
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def _save_cache(cache):
     try:
-        SECTOR_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+        cache_write_enveloped(SECTOR_CACHE_PATH, "sector_strength", cache)
     except Exception as e:
         print(f"  ⚠ Could not save sector cache: {e}")
 

@@ -10,6 +10,7 @@ from chartink_reader import read_chartink_exports, print_summary
 from notion_push import push_to_notion
 from config import GATE_SCREEN, WEIGHT_TECHNICAL, WEIGHT_FUNDAMENTAL
 from sector_strength import enrich_with_sector_strength
+from reliability_utils import cache_read_enveloped, cache_write_enveloped, write_json
 
 load_dotenv()
 
@@ -32,11 +33,18 @@ ETF_KEYWORDS = ["ETF", "BEES", "LIQUID", "SDL", "CPSE", "GOLDBEES",
 # ─────────────────────────────────────────────
 def load_gate_screen_cached(session):
     cache_path = "output/gate_screen_cache.csv"
-    meta_path  = "output/gate_screen_cache_date.txt"
+    meta_path  = "output/gate_screen_cache.meta.json"
     today      = datetime.now().strftime("%Y-%m-%d")
 
     if os.path.exists(cache_path) and os.path.exists(meta_path):
-        cached_date = open(meta_path).read().strip()
+        meta, malformed = cache_read_enveloped(
+            meta_path,
+            expected_source="main_gate_screen_meta",
+            default_data={}
+        )
+        if malformed:
+            meta = {}
+        cached_date = meta.get("date")
         if cached_date == today:
             df = pd.read_csv(cache_path)
             print(f"✓ Gate screen loaded from cache — {len(df)} companies")
@@ -49,7 +57,11 @@ def load_gate_screen_cached(session):
 
     gate_df = clean_dataframe(raw_df)
     gate_df.to_csv(cache_path, index=False)
-    open(meta_path, "w").write(today)
+    cache_write_enveloped(
+        meta_path,
+        "main_gate_screen_meta",
+        {"date": today, "rows": len(gate_df)}
+    )
     print(f"✓ Gate screen fetched and cached — {len(gate_df)} companies")
     return gate_df
 
@@ -153,17 +165,43 @@ def score_fundamentals(row):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     print("=== Trading Agent — Full Pipeline ===\n")
+    run_report = {
+        "started_at": datetime.now().isoformat(),
+        "status": "running",
+        "steps": {},
+    }
 
     # step 1 — market breadth
-    gate_passes, market_condition, breadth_results = check_market_breadth()
-    with open("output/market_condition.txt", "w") as f:
-        f.write(market_condition)
+    try:
+        gate_passes, market_condition, breadth_results = check_market_breadth()
+        with open("output/market_condition.txt", "w") as f:
+            f.write(market_condition)
+        run_report["steps"]["market_breadth"] = {
+            "status": "ok",
+            "market_condition": market_condition,
+        }
+    except Exception as e:
+        gate_passes, market_condition, breadth_results = False, "UNKNOWN", {}
+        run_report["steps"]["market_breadth"] = {
+            "status": "error",
+            "error": str(e),
+        }
     print()
 
     # step 2 — chartink exports
     print("=== Chartink Exports ===\n")
-    chartink_df = read_chartink_exports()
+    try:
+        chartink_df = read_chartink_exports()
+    except Exception as e:
+        chartink_df = None
+        run_report["steps"]["chartink_exports"] = {"status": "error", "error": str(e)}
     if chartink_df is None:
+        run_report["status"] = "failed"
+        run_report["steps"]["chartink_exports"] = run_report["steps"].get(
+            "chartink_exports", {"status": "error", "error": "No Chartink data"}
+        )
+        run_report["finished_at"] = datetime.now().isoformat()
+        write_json("output/run_report.json", run_report)
         print("✗ No Chartink data — put CSVs in chartink_exports/ and retry")
         exit(0)
 
@@ -178,6 +216,10 @@ if __name__ == "__main__":
         print(f"  Filtered out {removed} ETFs/index funds")
 
     print_summary(chartink_df)
+    run_report["steps"]["chartink_exports"] = {
+        "status": "ok",
+        "rows_after_filter": int(len(chartink_df))
+    }
     chartink_df.to_csv("output/chartink_combined.csv", index=False)
     print(f"Total stocks after ETF filter: {len(chartink_df)}\n")
 
@@ -185,13 +227,22 @@ if __name__ == "__main__":
     print("=== Fundamental Gate Screen ===\n")
     session = get_session(EMAIL, PASSWORD)
     if not session:
+        run_report["status"] = "failed"
+        run_report["steps"]["fundamental_gate"] = {"status": "error", "error": "Screener login failed"}
+        run_report["finished_at"] = datetime.now().isoformat()
+        write_json("output/run_report.json", run_report)
         print("✗ Could not log into Screener")
         exit(0)
 
     gate_df = load_gate_screen_cached(session)
     if gate_df is None:
+        run_report["status"] = "failed"
+        run_report["steps"]["fundamental_gate"] = {"status": "error", "error": "Could not fetch gate screen"}
+        run_report["finished_at"] = datetime.now().isoformat()
+        write_json("output/run_report.json", run_report)
         print("✗ Could not fetch gate screen")
         exit(0)
+    run_report["steps"]["fundamental_gate"] = {"status": "ok", "rows": int(len(gate_df))}
 
     gate_df.to_csv("output/gate_screen_clean.csv", index=False)
     gate_df["Name_upper"] = gate_df["Name"].str.strip().str.upper()
@@ -247,8 +298,13 @@ if __name__ == "__main__":
 
     print(f"\n  {len(matched_rows)} stocks matched\n")
     if not matched_rows:
+        run_report["status"] = "failed"
+        run_report["steps"]["intersection"] = {"status": "error", "error": "No matches found"}
+        run_report["finished_at"] = datetime.now().isoformat()
+        write_json("output/run_report.json", run_report)
         print("✗ No matches found")
         exit(0)
+    run_report["steps"]["intersection"] = {"status": "ok", "matched_rows": int(len(matched_rows))}
 
     matched_df = pd.DataFrame(matched_rows)
 
@@ -268,13 +324,18 @@ if __name__ == "__main__":
                     "tech_score", "funda_score", "priority"]
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
+    run_report["steps"]["scoring"] = {"status": "ok", "ranked_rows": int(len(matched_df))}
 
     # step 5a — sector enrichment and strength (post Chartink+Screener filter)
     print("\n=== Sector Mapping & Strength ===\n")
-    matched_df = enrich_with_sector_strength(matched_df)
-    if "sector" in matched_df.columns and "sector_strength_label" in matched_df.columns:
-        preview = matched_df[["symbol", "sector", "stock_perf_1m", "sector_strength", "sector_strength_label"]].head(15)
-        print(preview.to_string(index=False))
+    try:
+        matched_df = enrich_with_sector_strength(matched_df)
+        if "sector" in matched_df.columns and "sector_strength_label" in matched_df.columns:
+            preview = matched_df[["symbol", "sector", "stock_perf_1m", "sector_strength", "sector_strength_label"]].head(15)
+            print(preview.to_string(index=False))
+        run_report["steps"]["sector_strength"] = {"status": "ok"}
+    except Exception as e:
+        run_report["steps"]["sector_strength"] = {"status": "error", "error": str(e)}
 
     # step 5b — news analysis (web search via Groq compound)
     print()
@@ -338,13 +399,24 @@ if __name__ == "__main__":
             "verdict": "Neutral"
         })
         matched_df["ai_narrative"] = placeholder
+        run_report["steps"]["news_analysis"] = {"status": "error", "error": str(e)}
+    else:
+        run_report["steps"]["news_analysis"] = {"status": "ok"}
 
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
     # step 6 — notion push
-    push_to_notion(market_condition=market_condition, ranked_df=matched_df)
+    try:
+        push_stats = push_to_notion(market_condition=market_condition, ranked_df=matched_df)
+        run_report["steps"]["notion_push"] = {"status": "ok", "stats": push_stats or {}}
+    except Exception as e:
+        run_report["steps"]["notion_push"] = {"status": "error", "error": str(e)}
 
+    run_report["status"] = "completed"
+    run_report["finished_at"] = datetime.now().isoformat()
+    run_report["rows_final"] = int(len(matched_df))
+    write_json("output/run_report.json", run_report)
     print(f"\n✓ Pipeline complete — {len(matched_df)} companies")
     print(f"  Market condition: {market_condition}")
