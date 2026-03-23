@@ -260,6 +260,11 @@ def push_company(row, scan_date):
         verdict_clean = "Bearish"
 
     fundamentals = build_fundamentals(row)
+    sector = safe_str(row.get("sector", "Unknown")) or "Unknown"
+    sector_strength_label = safe_str(row.get("sector_strength_label", "Flat")) or "Flat"
+    sector_strength_value = safe_float(row.get("sector_strength", 0), 2)
+    nifty500_perf_1m = safe_float(row.get("nifty500_perf_1m", 0), 2)
+    sector_vs_nifty500 = safe_float(row.get("sector_vs_nifty500", 0), 2)
 
     existing = notion.databases.query(
         database_id=NOTION_DATABASE_ID,
@@ -280,10 +285,10 @@ def push_company(row, scan_date):
             "number": round(score * 100, 1)
         },
         "Sector": {
-            "select": {"name": "—"}
+            "select": {"name": sector[:100]}
         },
         "Sector Strength": {
-            "select": {"name": "—"}
+            "select": {"name": sector_strength_label[:100]}
         },
         "Market Condition": {
             "select": {"name": market}
@@ -301,7 +306,15 @@ def push_company(row, scan_date):
             "date": {"start": scan_date}
         },
         "Notes": {
-            "rich_text": [{"text": {"content": ""}}]
+            "rich_text": [{
+                "text": {
+                    "content": (
+                        f"Sector 1M avg: {sector_strength_value}% | "
+                        f"Nifty500 1M: {nifty500_perf_1m}% | "
+                        f"Alpha vs Nifty500: {sector_vs_nifty500}%"
+                    )
+                }
+            }]
         },
     }
 

@@ -23,6 +23,7 @@ for d in [NSE_COOKIE_DIR, NSE_CACHE_DIR, AI_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 GROQ_MODEL = "groq/compound"
+MAX_ANNOUNCEMENTS_FOR_PROMPT = 5
 
 IMPORTANT_TYPES = {
     "order", "contract", "bagging", "award", "win",
@@ -85,6 +86,7 @@ def update_nse_cache(symbol):
 
     last_fetch = cache.get("last_fetch")
     is_cached  = (last_fetch == today_str)
+    new_items  = []
 
     if not is_cached:
         if last_fetch:
@@ -94,14 +96,15 @@ def update_nse_cache(symbol):
             since = datetime.now() - timedelta(days=90)
             print(f"  ✓ {symbol} NSE (first fetch — 90 days)")
 
-        new_items     = _fetch_announcements_since(symbol, since)
+        fetched_items = _fetch_announcements_since(symbol, since)
         existing_keys = {(i["date"], i["desc"]) for i in cache["items"]}
 
-        for item in new_items:
+        for item in fetched_items:
             key = (item["date"], item["desc"])
             if key not in existing_keys:
                 cache["items"].append(item)
                 existing_keys.add(key)
+                new_items.append(item)
 
         cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
         cache["items"] = [
@@ -117,7 +120,7 @@ def update_nse_cache(symbol):
     else:
         print(f"  ↺ {symbol} NSE (cached)")
 
-    return cache
+    return cache, new_items
 
 
 def get_important_announcements(symbol):
@@ -138,17 +141,34 @@ def get_important_announcements(symbol):
         return []
 
 
-def get_ai_analysis(symbol):
+def get_ai_analysis(symbol, max_age_days=30):
     cache_file = AI_CACHE_DIR / f"{symbol}.json"
-    today      = datetime.now().strftime("%Y-%m-%d")
-    if cache_file.exists():
-        try:
-            cached = json.loads(cache_file.read_text())
-            if cached.get("date") == today:
-                return cached["analysis"]
-        except Exception:
-            pass
-    return None
+    if not cache_file.exists():
+        return None
+
+    try:
+        cached = json.loads(cache_file.read_text())
+        analysis = cached.get("analysis")
+        cache_date = cached.get("date")
+
+        if not analysis:
+            return None
+
+        if cache_date:
+            try:
+                saved_date = datetime.strptime(cache_date, "%Y-%m-%d")
+                age_days = (datetime.now() - saved_date).days
+            except Exception:
+                age_days = max_age_days + 1
+
+            if age_days > max_age_days:
+                # too old, re-run
+                return None
+
+        # keep cached analysis if valid and not stale
+        return analysis
+    except Exception:
+        return None
 
 
 def save_ai_analysis(symbol, analysis_dict):
@@ -188,6 +208,56 @@ def save_ai_analysis(symbol, analysis_dict):
         print(f"    ✓ Cached analysis for {symbol}")
     except Exception as e:
         print(f"    ✗ Failed to cache {symbol}: {e}")
+
+
+def merge_ai_analysis(existing, incoming):
+    if not isinstance(existing, dict):
+        return incoming
+
+    if not isinstance(incoming, dict):
+        return existing
+
+    merged = existing.copy()
+
+    def normalize(s):
+        if not s:
+            return ""
+        return str(s).strip()
+
+    for field in ["red_flags", "catalysts"]:
+        old_val = normalize(existing.get(field, ""))
+        new_val = normalize(incoming.get(field, ""))
+
+        if not new_val or new_val.lower() in ["none", "no data available", "analysis unavailable"]:
+            merged[field] = old_val or "None"
+        elif not old_val or old_val.lower() in ["none", "no data available", "analysis unavailable"]:
+            merged[field] = new_val
+        elif new_val.lower() == old_val.lower():
+            merged[field] = old_val
+        else:
+            merged[field] = f"{old_val}; {new_val}"
+
+    # Verdict: prefer non-neutral recent signal, else keep existing
+    current_verdict = normalize(existing.get("verdict", "Neutral")).title()
+    incoming_verdict = normalize(incoming.get("verdict", "Neutral")).title()
+
+    if incoming_verdict in ["Bullish", "Bearish"]:
+        merged["verdict"] = incoming_verdict
+    else:
+        merged["verdict"] = current_verdict or "Neutral"
+
+    return merged
+
+
+def incremental_ai_analysis(symbol, existing_analysis, new_announcements):
+    if not new_announcements:
+        return existing_analysis
+
+    incoming = analyze_stock(symbol, new_announcements)
+    if not is_analysis_available(incoming):
+        return existing_analysis
+
+    return merge_ai_analysis(existing_analysis, incoming)
 
 
 def is_analysis_available(analysis_dict):
@@ -281,13 +351,32 @@ def parse_response(raw):
     return results
 
 
-def analyze_stock(symbol, announcements):
+def _build_announcement_block(announcements, max_items=MAX_ANNOUNCEMENTS_FOR_PROMPT):
     if not announcements:
-        ann_text = "No recent announcements found."
-    else:
-        ann_text = "\n".join(announcements)
+        return "No recent announcements found."
 
-    prompt = f"""You are a senior equity analyst covering Indian stock markets.
+    full_lines = [
+        str(ann).strip().replace("\n", " ")
+        for ann in announcements[:max_items]
+    ]
+    return "\n".join(full_lines)
+
+
+def _build_prompt(symbol, ann_text, compact=False):
+    if compact:
+        return f"""You are a senior equity analyst for Indian stocks.
+
+Analyze {symbol} using these recent NSE announcements:
+{ann_text}
+
+Give concise output in EXACT format:
+SYMBOL: {symbol}
+RED_FLAGS: [max 2 short points or None]
+CATALYSTS: [max 2 short points or None]
+VERDICT: Bullish OR Bearish OR Neutral
+==="""
+
+    return f"""You are a senior equity analyst covering Indian stock markets.
 
 I need you to research and analyze {symbol} (NSE listed Indian company).
 
@@ -308,47 +397,101 @@ CATALYSTS: [specific growth drivers with exact figures — or None]
 VERDICT: Bullish OR Bearish OR Neutral
 ==="""
 
-    for attempt in range(3):
+
+def _analyze_with_prompt(symbol, prompt):
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1
+    )
+    raw = response.choices[0].message.content.strip()
+    results = parse_response(raw)
+
+    if symbol in results:
+        print(f"    ✓ Got response for {symbol}")
+        result_data = results[symbol]
+        print(f"      red_flags: {result_data.get('red_flags', 'MISSING')[:60]}...")
+        print(f"      catalysts: {result_data.get('catalysts', 'MISSING')[:60]}...")
+        return results[symbol]
+
+    print(f"    ✗ {symbol} not in parse results")
+    if results:
+        first_key = list(results.keys())[0]
+        print(f"      Using {first_key} data instead")
+        return results[first_key]
+
+    return {
+        "red_flags": "Analysis unavailable",
+        "catalysts": "Analysis unavailable",
+        "verdict": "Neutral"
+    }
+
+
+def analyze_stock(symbol, announcements):
+    # Quality-first:
+    # Try full context first; only split if request hits 413.
+    ann_text = _build_announcement_block(announcements, max_items=MAX_ANNOUNCEMENTS_FOR_PROMPT)
+    prompt = _build_prompt(symbol, ann_text, compact=False)
+    for attempt in range(2):
         try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            raw     = response.choices[0].message.content.strip()
-            results = parse_response(raw)
-            
-            # DEBUG
-            if symbol in results:
-                print(f"    ✓ Got response for {symbol}")
-                result_data = results[symbol]
-                print(f"      red_flags: {result_data.get('red_flags', 'MISSING')[:60]}...")
-                print(f"      catalysts: {result_data.get('catalysts', 'MISSING')[:60]}...")
-            else:
-                print(f"    ✗ {symbol} not in parse results")
-                if results:
-                    first_key = list(results.keys())[0]
-                    results[symbol] = results[first_key]
-                    print(f"      Using {first_key} data instead")
-
-            return results.get(symbol, {
-                "red_flags": "Analysis unavailable",
-                "catalysts": "Analysis unavailable",
-                "verdict":   "Neutral"
-            })
-
+            return _analyze_with_prompt(symbol, prompt)
         except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                wait = 30 * (attempt + 1)  # 30s then 60s
+            msg = str(e)
+            if "429" in msg:
+                wait = 20
                 print(f"    Rate limit — waiting {wait}s...")
                 time.sleep(wait)
-            else:
-                print(f"  ✗ {symbol} analysis error: {e}")
-                return {
-                    "red_flags": "Analysis unavailable",
-                    "catalysts": "Analysis unavailable",
-                    "verdict":   "Neutral"
-                }
+                continue
+            if "413" in msg:
+                print("    Request too large on full prompt — switching to split fallback...")
+                break
+            print(f"  ✗ {symbol} analysis error: {e}")
+            return {
+                "red_flags": "Analysis unavailable",
+                "catalysts": "Analysis unavailable",
+                "verdict": "Neutral"
+            }
+
+    # Split fallback: keep full announcement text per chunk, no pre-truncation.
+    if announcements:
+        chunks = [announcements[:3], announcements[3:5]]
+        merged = {
+            "red_flags": "None",
+            "catalysts": "None",
+            "verdict": "Neutral"
+        }
+        got_any = False
+
+        for idx, chunk in enumerate(chunks, start=1):
+            if not chunk:
+                continue
+            ann_text = _build_announcement_block(chunk, max_items=len(chunk))
+            prompt = _build_prompt(symbol, ann_text, compact=False)
+            try:
+                print(f"    Split fallback chunk {idx}/{len(chunks)}...")
+                partial = _analyze_with_prompt(symbol, prompt)
+                if is_analysis_available(partial):
+                    merged = merge_ai_analysis(merged, partial)
+                    got_any = True
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg:
+                    print("    Rate limit in split fallback — waiting 20s...")
+                    time.sleep(20)
+                    try:
+                        partial = _analyze_with_prompt(symbol, prompt)
+                        if is_analysis_available(partial):
+                            merged = merge_ai_analysis(merged, partial)
+                            got_any = True
+                    except Exception:
+                        pass
+                elif "413" in msg:
+                    print(f"    Split chunk {idx} still too large — skipping chunk.")
+                else:
+                    print(f"    Split chunk {idx} failed: {e}")
+
+        if got_any:
+            return merged
 
     return {
         "red_flags": "Analysis unavailable",
@@ -360,25 +503,69 @@ VERDICT: Bullish OR Bearish OR Neutral
 def run_news_analysis(symbols, batch_size=3, screener_session=None):
     print(f"\n=== News Analysis ({len(symbols)} stocks, model: {GROQ_MODEL}) ===\n")
 
-    # step 1 — update NSE cache
+    # step 1 — update NSE cache and gather new items
     print("  Updating NSE announcement cache...")
+    symbol_updates = {}
     for symbol in symbols:
-        update_nse_cache(symbol)
+        nse_cache, new_items = update_nse_cache(symbol)
+        symbol_updates[symbol] = {
+            "nse_cache": nse_cache,
+            "new_items": new_items,
+            "updated": bool(new_items)
+        }
         time.sleep(0.3)
 
-    # step 2 — determine what needs analysis
-    needs_analysis = [s for s in symbols if get_ai_analysis(s) is None]
+    # step 2 — decide what needs analysis
+    needs_analysis = []
+    for symbol in symbols:
+        cached = get_ai_analysis(symbol)
+        if cached is None:
+            needs_analysis.append(symbol)
+        elif symbol_updates[symbol]["updated"]:
+            needs_analysis.append(symbol)
+
     cached_count   = len(symbols) - len(needs_analysis)
     print(f"\n  AI: {cached_count} cached, {len(needs_analysis)} need analysis")
 
-    # step 3 — analyze with web search
+    # step 3 — analyze with web search (new-only if existing cached)
     if needs_analysis:
         print(f"\n  Running Groq compound (web search) for {len(needs_analysis)} stocks...")
         for i, symbol in enumerate(needs_analysis):
-            announcements = get_important_announcements(symbol)
-            print(f"  [{i+1}/{len(needs_analysis)}] {symbol} ({len(announcements)} announcements)")
-            analysis = analyze_stock(symbol, announcements)
-            save_ai_analysis(symbol, analysis)
+            if symbol_updates[symbol]["updated"] and get_ai_analysis(symbol) is not None:
+                # incremental run only for new update block
+                new_announcements = [
+                    f"[{x['date'][:10]}] {x['desc']}"
+                    for x in symbol_updates[symbol]["new_items"]
+                ]
+                print(f"  [{i+1}/{len(needs_analysis)}] {symbol} (incremental {len(new_announcements)} updates)")
+
+                existing_analysis = get_ai_analysis(symbol) or {
+                    "red_flags": "No data available",
+                    "catalysts": "No data available",
+                    "verdict": "Neutral"
+                }
+                analysis = incremental_ai_analysis(symbol, existing_analysis, new_announcements)
+
+            else:
+                announcements = get_important_announcements(symbol)
+                print(f"  [{i+1}/{len(needs_analysis)}] {symbol} ({len(announcements)} announcements)")
+                analysis = analyze_stock(symbol, announcements)
+
+            if is_analysis_available(analysis):
+                save_ai_analysis(symbol, analysis)
+            else:
+                # if invalid result, keep old cache if any
+                old_cached = get_ai_analysis(symbol)
+                if old_cached:
+                    analysis = old_cached
+                else:
+                    analysis = {
+                        "red_flags": "No data available",
+                        "catalysts": "No data available",
+                        "verdict": "Neutral"
+                    }
+                    # no save for unavailable
+
             time.sleep(5)  # increased buffer to avoid TPM limits
     else:
         print("  All analysis loaded from cache")

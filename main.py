@@ -9,6 +9,7 @@ from market_breadth import check_market_breadth
 from chartink_reader import read_chartink_exports, print_summary
 from notion_push import push_to_notion
 from config import GATE_SCREEN, WEIGHT_TECHNICAL, WEIGHT_FUNDAMENTAL
+from sector_strength import enrich_with_sector_strength
 
 load_dotenv()
 
@@ -267,6 +268,13 @@ if __name__ == "__main__":
                     "tech_score", "funda_score", "priority"]
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print(matched_df[display_cols].head(15).to_string(index=False))
+
+    # step 5a — sector enrichment and strength (post Chartink+Screener filter)
+    print("\n=== Sector Mapping & Strength ===\n")
+    matched_df = enrich_with_sector_strength(matched_df)
+    if "sector" in matched_df.columns and "sector_strength_label" in matched_df.columns:
+        preview = matched_df[["symbol", "sector", "stock_perf_1m", "sector_strength", "sector_strength_label"]].head(15)
+        print(preview.to_string(index=False))
 
     # step 5b — news analysis (web search via Groq compound)
     print()
