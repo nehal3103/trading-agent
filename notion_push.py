@@ -196,6 +196,9 @@ def get_ipo_label(row):
 
 
 def build_fundamentals(row):
+    tech_score = safe_float(row.get("tech_score"), 4)
+    funda_score = safe_float(row.get("funda_score"), 4)
+
     roe = safe_float(row.get("ROE%"))
     roce = safe_float(row.get("ROCE%"))
     de = safe_float(row.get("Debt / Eq"))
@@ -226,48 +229,39 @@ def build_fundamentals(row):
     else:
         trend = "— Data unavailable"
 
-    explain_lines = [
-        "=== SCORE BREAKDOWN ===",
-        f"Tech score              : {safe_float(row.get('tech_score'), 4)}",
-        f"Funda score             : {safe_float(row.get('funda_score'), 4)}",
-        f"ROE component           : {safe_float(row.get('roe_component'), 4)}",
-        f"ROCE component          : {safe_float(row.get('roce_component'), 4)}",
-        f"Debt component          : {safe_float(row.get('debt_component'), 4)}",
-        f"Promoter component      : {safe_float(row.get('promoter_component'), 4)}",
-        f"Growth component        : {safe_float(row.get('growth_component'), 4)}",
-        f"Valuation component     : {safe_float(row.get('valuation_component'), 4)}",
-        f"Quarterly trend comp.   : {safe_float(row.get('quarterly_trend_component'), 4)}",
-        f"Match method            : {safe_str(row.get('match_method', ''))}",
-        f"Match confidence        : {safe_float(row.get('match_confidence'), 2)}",
+    lines = [
+        "=== SCORES ===",
+        f"Tech score     : {tech_score}",
+        f"Funda score    : {funda_score}",
         "",
         "=== PROFITABILITY ===",
-        f"ROE          : {roe}%",
-        f"ROCE         : {roce}%",
+        f"ROE            : {roe}%",
+        f"ROCE           : {roce}%",
         "",
         "=== VALUATION ===",
-        f"P/E          : {pe}x  (Industry: {ind_pe}x)",
-        f"P/E vs Ind   : {'Below' if pe and ind_pe and pe < ind_pe * 2 else 'Above'} 2x industry",
+        f"P/E            : {pe}x  (Industry: {ind_pe}x)",
+        f"P/E vs Ind     : {'Below' if pe and ind_pe and pe < ind_pe * 2 else 'Above'} 2x industry",
         "",
         "=== SAFETY ===",
-        f"Debt/Equity  : {de}",
-        f"Int Coverage : {int_cov}x",
-        f"Promoter     : {promoter}%",
+        f"Debt/Equity    : {de}",
+        f"Int Coverage   : {int_cov}x",
+        f"Promoter       : {promoter}%",
         "",
         "=== GROWTH ===",
-        f"Sales growth : {sales_g}% (3yr)",
-        f"Profit growth: {profit_g}% (3yr)",
+        f"Sales growth   : {sales_g}% (3yr)",
+        f"Profit growth  : {profit_g}% (3yr)",
         "",
         "=== QUARTERLY REVENUE TREND ===",
-        f"Latest Qtr   : Rs.{q1} Cr",
-        f"2 Qtrs back  : Rs.{q2} Cr",
-        f"3 Qtrs back  : Rs.{q3} Cr",
-        f"Trend        : {trend}",
+        f"Latest Qtr     : Rs.{q1} Cr",
+        f"2 Qtrs back    : Rs.{q2} Cr",
+        f"3 Qtrs back    : Rs.{q3} Cr",
+        f"Trend          : {trend}",
         "",
         "=== OTHER ===",
-        f"Market Cap   : Rs.{mar_cap} Cr",
-        f"OCF          : Rs.{cfo} Cr",
+        f"Market Cap     : Rs.{mar_cap} Cr",
+        f"OCF            : Rs.{cfo} Cr",
     ]
-    return "\n".join(str(l) for l in explain_lines)
+    return "\n".join(str(l) for l in lines)
 
 
 def is_ai_analysis_available(analysis_dict):

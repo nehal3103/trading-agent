@@ -125,7 +125,16 @@ def _num(value, default=0.0):
     return float(val)
 
 
-def get_fundamental_breakdown(row):
+def score_fundamentals(row):
+    score = 0.0
+    max_score = 0.0
+
+    def add(condition, points):
+        nonlocal score, max_score
+        max_score += points
+        if condition:
+            score += points
+
     roe = _num(row.get("ROE%", 0), 0)
     roce = _num(row.get("ROCE%", 0), 0)
     de = _num(row.get("Debt / Eq", 999), 999)
@@ -135,87 +144,45 @@ def get_fundamental_breakdown(row):
     pe = _num(row.get("P/E", 999), 999)
     ind_pe = _num(row.get("Ind PE", 1), 1)
 
+    add(roe > 25, 2)
+    add(roe > 15, 1)
+    add(roe > 10, 0.5)
+
+    add(roce > 25, 2)
+    add(roce > 15, 1)
+    add(roce > 10, 0.5)
+
+    add(de < 0.3, 2)
+    add(de < 0.7, 1)
+    add(de < 1.5, 0.5)
+
+    add(promoter > 60, 2)
+    add(promoter > 50, 1)
+    add(promoter > 40, 0.5)
+
+    add(sales_g > 20, 2)
+    add(sales_g > 10, 1)
+    add(sales_g > 0, 0.5)
+
+    add(profit_g > 20, 2)
+    add(profit_g > 10, 1)
+    add(profit_g > 0, 0.5)
+
+    add(pe < ind_pe * 2, 1)
+    add(pe < ind_pe * 1.5, 1)
+
     q_curr = _num(row.get("Sales Qtr Rs.Cr.", 0), 0)
     q_prev = _num(row.get("Sales 2Qtr Bk Rs.Cr.", 0), 0)
     q_prev2 = _num(row.get("Sales 3Qtr Bk Rs.Cr.", 0), 0)
 
-    def normalized_hits(condition_tiers):
-        score = 0.0
-        max_score = 0.0
-        for condition, points in condition_tiers:
-            max_score += points
-            if condition:
-                score += points
-        return (score / max_score) if max_score else 0.0
-
-    roe_component = normalized_hits([
-        (roe > 25, 2),
-        (roe > 15, 1),
-        (roe > 10, 0.5),
-    ])
-
-    roce_component = normalized_hits([
-        (roce > 25, 2),
-        (roce > 15, 1),
-        (roce > 10, 0.5),
-    ])
-
-    debt_component = normalized_hits([
-        (de < 0.3, 2),
-        (de < 0.7, 1),
-        (de < 1.5, 0.5),
-    ])
-
-    promoter_component = normalized_hits([
-        (promoter > 60, 2),
-        (promoter > 50, 1),
-        (promoter > 40, 0.5),
-    ])
-
-    growth_component = normalized_hits([
-        (sales_g > 20, 2),
-        (sales_g > 10, 1),
-        (sales_g > 0, 0.5),
-        (profit_g > 20, 2),
-        (profit_g > 10, 1),
-        (profit_g > 0, 0.5),
-    ])
-
-    valuation_component = normalized_hits([
-        (pe < ind_pe * 2, 1),
-        (pe < ind_pe * 1.5, 1),
-    ])
-
-    quarterly_trend_component = 0.0
     if q_curr > 0 and q_prev > 0 and q_prev2 > 0:
-        quarterly_trend_component = normalized_hits([
-            (q_curr > q_prev > q_prev2, 3),
-            (q_curr > q_prev, 1),
-        ])
+        add(q_curr > q_prev > q_prev2, 3)
+        add(q_curr > q_prev, 1)
 
-    funda_score = round(
-        (
-            roe_component +
-            roce_component +
-            debt_component +
-            promoter_component +
-            growth_component +
-            valuation_component +
-            quarterly_trend_component
-        ) / 7.0,
-        4
-    )
+    if max_score == 0:
+        return 0.0
 
-    return {
-        "roe_component": round(roe_component, 4),
-        "roce_component": round(roce_component, 4),
-        "debt_component": round(debt_component, 4),
-        "promoter_component": round(promoter_component, 4),
-        "growth_component": round(growth_component, 4),
-        "valuation_component": round(valuation_component, 4),
-        "quarterly_trend_component": round(quarterly_trend_component, 4),
-        "funda_score": funda_score,
-    }
+    return round(score / max_score, 4)
 
 
 def fuzzy_match_stock(c_symbol, c_stock_name, gate_df, nse_df):
@@ -367,12 +334,7 @@ def run_pipeline():
 
     print("=== Scoring ===\n")
     matched_df["tech_score"] = matched_df.apply(technical_conviction_score, axis=1)
-
-    funda_breakdown = matched_df.apply(
-        lambda row: pd.Series(get_fundamental_breakdown(row)),
-        axis=1
-    )
-    matched_df = pd.concat([matched_df, funda_breakdown], axis=1)
+    matched_df["funda_score"] = matched_df.apply(score_fundamentals, axis=1)
 
     matched_df["final_score"] = (
         WEIGHT_TECHNICAL * matched_df["tech_score"] +
@@ -381,8 +343,8 @@ def run_pipeline():
     matched_df["market_condition"] = market_condition
 
     matched_df = matched_df.sort_values(
-        ["final_score", "match_confidence", "scanner_count"],
-        ascending=[False, False, False]
+        ["final_score", "scanner_count"],
+        ascending=[False, False]
     )
 
     tracked_cols = ["symbol", "stock_name", "scanner_count", "scanners", "priority"]
@@ -394,7 +356,7 @@ def run_pipeline():
 
     display_cols = [
         "symbol", "stock_name", "final_score", "tech_score", "funda_score",
-        "scanner_count", "priority", "match_method", "match_confidence"
+        "scanner_count", "priority"
     ]
     display_cols = [c for c in display_cols if c in matched_df.columns]
     print("Top 15:")
@@ -465,21 +427,26 @@ def run_pipeline():
         "scanners",
         "priority",
         "market_condition",
-        "match_method",
-        "match_confidence",
-        "roe_component",
-        "roce_component",
-        "debt_component",
-        "promoter_component",
-        "growth_component",
-        "valuation_component",
-        "quarterly_trend_component",
         "sector",
         "stock_perf_1m",
         "candidate_sector_avg_1m",
         "nifty500_perf_1m",
         "candidate_sector_vs_nifty500",
         "candidate_sector_strength_label",
+        "ROE%",
+        "ROCE%",
+        "Debt / Eq",
+        "Prom. Hold.%",
+        "P/E",
+        "Ind PE",
+        "Sales growth %",
+        "Profit growth %",
+        "Int Coverage",
+        "CF Operations Rs.Cr.",
+        "Mar Cap Rs.Cr.",
+        "Sales Qtr Rs.Cr.",
+        "Sales 2Qtr Bk Rs.Cr.",
+        "Sales 3Qtr Bk Rs.Cr.",
         "ai_narrative",
     ]
 
