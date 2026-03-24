@@ -47,7 +47,6 @@ def _build_nse_session():
         "Connection": "keep-alive",
     })
     try:
-        # Cookie priming is required for NSE APIs.
         session.get(NSE_HOME_URL, timeout=10)
     except Exception:
         pass
@@ -122,10 +121,14 @@ def enrich_with_sector_strength(df):
     Adds:
       - sector
       - stock_perf_1m
-      - sector_strength (avg 1M perf of sector in current candidate set)
+      - candidate_sector_avg_1m
       - nifty500_perf_1m
-      - sector_vs_nifty500 (sector_strength - nifty500_perf_1m)
-      - sector_strength_label (vs Nifty 500)
+      - candidate_sector_vs_nifty500
+      - candidate_sector_strength_label
+
+    Important:
+    candidate_sector_avg_1m is based only on the current shortlisted
+    candidate set, not the full sector universe.
     """
     if df is None or df.empty or "symbol" not in df.columns:
         return df
@@ -160,16 +163,19 @@ def enrich_with_sector_strength(df):
     out["sector"] = sectors
     out["stock_perf_1m"] = perfs
 
-    sector_strength = (
+    candidate_sector_avg = (
         out.groupby("sector", dropna=False)["stock_perf_1m"]
         .mean()
         .round(2)
         .to_dict()
     )
-    out["sector_strength"] = out["sector"].map(sector_strength).fillna(0.0)
+
+    out["candidate_sector_avg_1m"] = out["sector"].map(candidate_sector_avg).fillna(0.0)
     nifty500_perf_1m = _fetch_nifty_500_perf_1m()
     out["nifty500_perf_1m"] = nifty500_perf_1m
-    out["sector_vs_nifty500"] = (out["sector_strength"] - nifty500_perf_1m).round(2)
+    out["candidate_sector_vs_nifty500"] = (
+        out["candidate_sector_avg_1m"] - nifty500_perf_1m
+    ).round(2)
 
     def strength_label(alpha):
         if alpha >= 2:
@@ -180,5 +186,7 @@ def enrich_with_sector_strength(df):
             return "Slightly Weak vs Nifty500"
         return "Weak vs Nifty500"
 
-    out["sector_strength_label"] = out["sector_vs_nifty500"].apply(strength_label)
+    out["candidate_sector_strength_label"] = (
+        out["candidate_sector_vs_nifty500"].apply(strength_label)
+    )
     return out

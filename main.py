@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from reliability_utils import cache_read_enveloped, cache_write_enveloped, write
 
 load_dotenv()
 
-EMAIL    = os.getenv("SCREENER_EMAIL")
+EMAIL = os.getenv("SCREENER_EMAIL")
 PASSWORD = os.getenv("SCREENER_PASSWORD")
 
 os.makedirs("output", exist_ok=True)
@@ -25,17 +26,16 @@ STOP_WORDS = {
     "corporation", "corp", "co",
 }
 
-ETF_KEYWORDS = ["ETF", "BEES", "LIQUID", "SDL", "CPSE", "GOLDBEES",
-                "NIFTYBEES", "JUNIORBEES", "BANKBEES"]
+ETF_KEYWORDS = [
+    "ETF", "BEES", "LIQUID", "SDL", "CPSE", "GOLDBEES",
+    "NIFTYBEES", "JUNIORBEES", "BANKBEES"
+]
 
 
-# ─────────────────────────────────────────────
-# SCREENER GATE CACHE
-# ─────────────────────────────────────────────
 def load_gate_screen_cached(session):
     cache_path = "output/gate_screen_cache.csv"
-    meta_path  = "output/gate_screen_cache.meta.json"
-    today      = datetime.now().strftime("%Y-%m-%d")
+    meta_path = "output/gate_screen_cache.meta.json"
+    today = datetime.now().strftime("%Y-%m-%d")
 
     if os.path.exists(cache_path) and os.path.exists(meta_path):
         meta, malformed = cache_read_enveloped(
@@ -67,18 +67,16 @@ def load_gate_screen_cached(session):
     return gate_df
 
 
-# ─────────────────────────────────────────────
-# NSE REFERENCE
-# ─────────────────────────────────────────────
 def load_nse_reference():
     path = "nse_symbols.csv"
     if not os.path.exists(path):
         print("  ⚠ nse_symbols.csv not found")
         return None
+
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip()
-    df["SYMBOL"]          = df["SYMBOL"].str.strip().str.upper()
-    df["NAME OF COMPANY"] = df["NAME OF COMPANY"].str.strip().str.upper()
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+    df["NAME OF COMPANY"] = df["NAME OF COMPANY"].astype(str).str.strip().str.upper()
     print(f"  NSE reference loaded — {len(df)} symbols")
     return df
 
@@ -86,84 +84,173 @@ def load_nse_reference():
 def get_search_key(symbol, nse_df):
     if nse_df is None:
         return None
+
     match = nse_df[nse_df["SYMBOL"] == symbol]
     if match.empty:
         return None
-    name  = match.iloc[0]["NAME OF COMPANY"]
+
+    name = match.iloc[0]["NAME OF COMPANY"]
     words = name.split()
-    sig   = []
+    sig = []
+
     for w in words:
         clean = w.lower().strip(".,&()")
         if clean not in STOP_WORDS and len(clean) >= 2:
             sig.append(clean)
         if len(sig) == 2:
             break
+
     return " ".join(sig) if sig else None
 
 
-# ─────────────────────────────────────────────
-# TECHNICAL CONVICTION SCORE
-# ─────────────────────────────────────────────
 def technical_conviction_score(row):
-    count    = int(row.get("scanner_count", 1))
-    priority = str(row.get("priority", ""))
+    count = int(row.get("scanner_count", 1))
+    priority = str(row.get("priority", "")).lower()
+
     if count == 3:
         return 1.0
-    elif "stage2" in priority and "institutions" in priority:
+    if "stage2" in priority and "institutions" in priority:
         return 0.9
-    elif "stage2" in priority and "base" in priority:
+    if "stage2" in priority and "base" in priority:
         return 0.8
-    elif "institutions" in priority and "base" in priority:
+    if "institutions" in priority and "base" in priority:
         return 0.75
-    else:
-        return 0.6
+    return 0.6
 
 
-# ─────────────────────────────────────────────
-# FUNDAMENTAL SCORE
-# ─────────────────────────────────────────────
-def score_fundamentals(row):
-    score     = 0.0
-    max_score = 0.0
+def _num(value, default=0.0):
+    val = pd.to_numeric(value, errors="coerce")
+    if pd.isna(val):
+        return default
+    return float(val)
 
-    def add(condition, points):
-        nonlocal score, max_score
-        max_score += points
-        if condition:
-            score += points
 
-    roe      = pd.to_numeric(row.get("ROE%", 0), errors="coerce") or 0
-    roce     = pd.to_numeric(row.get("ROCE%", 0), errors="coerce") or 0
-    de       = pd.to_numeric(row.get("Debt / Eq", 999), errors="coerce") or 999
-    promoter = pd.to_numeric(row.get("Prom. Hold.%", 0), errors="coerce") or 0
-    sales_g  = pd.to_numeric(row.get("Sales growth %", 0), errors="coerce") or 0
-    profit_g = pd.to_numeric(row.get("Profit growth %", 0), errors="coerce") or 0
-    pe       = pd.to_numeric(row.get("P/E", 999), errors="coerce") or 999
-    ind_pe   = pd.to_numeric(row.get("Ind PE", 1), errors="coerce") or 1
+def get_fundamental_breakdown(row):
+    roe = _num(row.get("ROE%", 0), 0)
+    roce = _num(row.get("ROCE%", 0), 0)
+    de = _num(row.get("Debt / Eq", 999), 999)
+    promoter = _num(row.get("Prom. Hold.%", 0), 0)
+    sales_g = _num(row.get("Sales growth %", 0), 0)
+    profit_g = _num(row.get("Profit growth %", 0), 0)
+    pe = _num(row.get("P/E", 999), 999)
+    ind_pe = _num(row.get("Ind PE", 1), 1)
 
-    add(roe > 25, 2);      add(roe > 15, 1);      add(roe > 10, 0.5)
-    add(roce > 25, 2);     add(roce > 15, 1);     add(roce > 10, 0.5)
-    add(de < 0.3, 2);      add(de < 0.7, 1);      add(de < 1.5, 0.5)
-    add(promoter > 60, 2); add(promoter > 50, 1); add(promoter > 40, 0.5)
-    add(sales_g > 20, 2);  add(sales_g > 10, 1);  add(sales_g > 0, 0.5)
-    add(profit_g > 20, 2); add(profit_g > 10, 1); add(profit_g > 0, 0.5)
-    add(pe < ind_pe * 2, 1); add(pe < ind_pe * 1.5, 1)
+    q_curr = _num(row.get("Sales Qtr Rs.Cr.", 0), 0)
+    q_prev = _num(row.get("Sales 2Qtr Bk Rs.Cr.", 0), 0)
+    q_prev2 = _num(row.get("Sales 3Qtr Bk Rs.Cr.", 0), 0)
 
-    q_curr  = pd.to_numeric(row.get("Sales Qtr Rs.Cr.", 0), errors="coerce") or 0
-    q_prev  = pd.to_numeric(row.get("Sales 2Qtr Bk Rs.Cr.", 0), errors="coerce") or 0
-    q_prev2 = pd.to_numeric(row.get("Sales 3Qtr Bk Rs.Cr.", 0), errors="coerce") or 0
+    def normalized_hits(condition_tiers):
+        score = 0.0
+        max_score = 0.0
+        for condition, points in condition_tiers:
+            max_score += points
+            if condition:
+                score += points
+        return (score / max_score) if max_score else 0.0
+
+    roe_component = normalized_hits([
+        (roe > 25, 2),
+        (roe > 15, 1),
+        (roe > 10, 0.5),
+    ])
+
+    roce_component = normalized_hits([
+        (roce > 25, 2),
+        (roce > 15, 1),
+        (roce > 10, 0.5),
+    ])
+
+    debt_component = normalized_hits([
+        (de < 0.3, 2),
+        (de < 0.7, 1),
+        (de < 1.5, 0.5),
+    ])
+
+    promoter_component = normalized_hits([
+        (promoter > 60, 2),
+        (promoter > 50, 1),
+        (promoter > 40, 0.5),
+    ])
+
+    growth_component = normalized_hits([
+        (sales_g > 20, 2),
+        (sales_g > 10, 1),
+        (sales_g > 0, 0.5),
+        (profit_g > 20, 2),
+        (profit_g > 10, 1),
+        (profit_g > 0, 0.5),
+    ])
+
+    valuation_component = normalized_hits([
+        (pe < ind_pe * 2, 1),
+        (pe < ind_pe * 1.5, 1),
+    ])
+
+    quarterly_trend_component = 0.0
     if q_curr > 0 and q_prev > 0 and q_prev2 > 0:
-        add(q_curr > q_prev > q_prev2, 3)
-        add(q_curr > q_prev, 1)
+        quarterly_trend_component = normalized_hits([
+            (q_curr > q_prev > q_prev2, 3),
+            (q_curr > q_prev, 1),
+        ])
 
-    if max_score == 0:
-        return 0.0
-    return round(score / max_score, 4)
+    funda_score = round(
+        (
+            roe_component +
+            roce_component +
+            debt_component +
+            promoter_component +
+            growth_component +
+            valuation_component +
+            quarterly_trend_component
+        ) / 7.0,
+        4
+    )
+
+    return {
+        "roe_component": round(roe_component, 4),
+        "roce_component": round(roce_component, 4),
+        "debt_component": round(debt_component, 4),
+        "promoter_component": round(promoter_component, 4),
+        "growth_component": round(growth_component, 4),
+        "valuation_component": round(valuation_component, 4),
+        "quarterly_trend_component": round(quarterly_trend_component, 4),
+        "funda_score": funda_score,
+    }
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+def fuzzy_match_stock(c_symbol, c_stock_name, gate_df, nse_df):
+    search_key = get_search_key(c_symbol, nse_df)
+
+    if not search_key:
+        words = c_stock_name.upper().split()
+        sig = []
+        for w in words:
+            clean = w.lower().strip(".,&()")
+            if clean not in STOP_WORDS and len(clean) >= 3:
+                sig.append(clean)
+            if len(sig) == 2:
+                break
+        search_key = " ".join(sig) if sig else None
+
+    if not search_key:
+        return None
+
+    match = gate_df.copy()
+    for word in search_key.split():
+        match = match[match["Name_upper"].str.contains(word.upper(), na=False)]
+
+    if len(match) == 1:
+        return match.iloc[0].to_dict(), "fuzzy_unique", 0.70
+
+    if len(match) > 1:
+        best = match.iloc[
+            (match["Name_upper"].str.len() - len(c_stock_name.upper())).abs().argsort()[:1]
+        ].iloc[0]
+        return best.to_dict(), "fuzzy_best_of_many", 0.55
+
+    return None
+
+
 def run_pipeline():
     print("=== Trading Agent — Full Pipeline ===\n")
     run_report = {
@@ -172,7 +259,6 @@ def run_pipeline():
         "steps": {},
     }
 
-    # step 1 — market breadth
     try:
         gate_passes, market_condition, breadth_results = check_market_breadth()
         with open("output/market_condition.txt", "w") as f:
@@ -189,13 +275,13 @@ def run_pipeline():
         }
     print()
 
-    # step 2 — chartink exports
     print("=== Chartink Exports ===\n")
     try:
         chartink_df = read_chartink_exports()
     except Exception as e:
         chartink_df = None
         run_report["steps"]["chartink_exports"] = {"status": "error", "error": str(e)}
+
     if chartink_df is None:
         run_report["status"] = "failed"
         run_report["steps"]["chartink_exports"] = run_report["steps"].get(
@@ -208,9 +294,7 @@ def run_pipeline():
 
     before = len(chartink_df)
     chartink_df = chartink_df[
-        ~chartink_df["symbol"].str.upper().str.contains(
-            "|".join(ETF_KEYWORDS), na=False
-        )
+        ~chartink_df["symbol"].str.upper().str.contains("|".join(ETF_KEYWORDS), na=False)
     ].copy()
     removed = before - len(chartink_df)
     if removed > 0:
@@ -224,7 +308,6 @@ def run_pipeline():
     chartink_df.to_csv("output/chartink_combined.csv", index=False)
     print(f"Total stocks after ETF filter: {len(chartink_df)}\n")
 
-    # step 3 — fundamental gate screen (cached)
     print("=== Fundamental Gate Screen ===\n")
     session = get_session(EMAIL, PASSWORD)
     if not session:
@@ -243,61 +326,34 @@ def run_pipeline():
         write_json("output/run_report.json", run_report)
         print("✗ Could not fetch gate screen")
         return run_report
-    run_report["steps"]["fundamental_gate"] = {"status": "ok", "rows": int(len(gate_df))}
 
+    run_report["steps"]["fundamental_gate"] = {"status": "ok", "rows": int(len(gate_df))}
     gate_df.to_csv("output/gate_screen_clean.csv", index=False)
-    gate_df["Name_upper"] = gate_df["Name"].str.strip().str.upper()
+    gate_df["Name_upper"] = gate_df["Name"].astype(str).str.strip().str.upper()
     print()
 
-    # step 4 — intersection
     print("=== Intersection — Chartink ∩ Screener ===\n")
     nse_df = load_nse_reference()
 
     matched_rows = []
+
     for _, c_row in chartink_df.iterrows():
-        c_symbol     = str(c_row["symbol"]).strip().upper()
+        c_symbol = str(c_row["symbol"]).strip().upper()
         c_stock_name = str(c_row["stock_name"]).strip()
 
-        search_key = get_search_key(c_symbol, nse_df)
-
-        if not search_key:
-            words = c_stock_name.upper().split()
-            sig   = []
-            for w in words:
-                clean = w.lower().strip(".,&()")
-                if clean not in STOP_WORDS and len(clean) >= 3:
-                    sig.append(clean)
-                if len(sig) == 2:
-                    break
-            search_key = " ".join(sig) if sig else None
-
-        if not search_key:
-            print(f"  ✗ {c_symbol:12} → no search key")
-            continue
-
-        search_words = search_key.split()
-        match        = gate_df.copy()
-        for word in search_words:
-            match = match[
-                match["Name_upper"].str.contains(word.upper(), na=False)
-            ]
-
-        if len(match) == 1:
-            combined = {**c_row.to_dict(), **match.iloc[0].to_dict()}
+        resolved = fuzzy_match_stock(c_symbol, c_stock_name, gate_df, nse_df)
+        if resolved is not None:
+            gate_match, match_method, match_confidence = resolved
+            combined = {**c_row.to_dict(), **gate_match}
+            combined["match_method"] = match_method
+            combined["match_confidence"] = match_confidence
             matched_rows.append(combined)
-            print(f"  ✓ {c_symbol:12} → {match.iloc[0]['Name']}")
-        elif len(match) > 1:
-            best = match.iloc[
-                (match["Name_upper"].str.len() - len(c_stock_name.upper()))
-                .abs().argsort()[:1]
-            ].iloc[0]
-            combined = {**c_row.to_dict(), **best.to_dict()}
-            matched_rows.append(combined)
-            print(f"  ✓ {c_symbol:12} → {best['Name']} (best of {len(match)})")
+            print(f"  ✓ {c_symbol:12} → {gate_match['Name']} [{match_method}]")
         else:
             print(f"  ✗ {c_symbol:12} → not in Screener gate")
 
     print(f"\n  {len(matched_rows)} stocks matched\n")
+
     if not matched_rows:
         run_report["status"] = "failed"
         run_report["steps"]["intersection"] = {"status": "error", "error": "No matches found"}
@@ -305,20 +361,29 @@ def run_pipeline():
         write_json("output/run_report.json", run_report)
         print("✗ No matches found")
         return run_report
-    run_report["steps"]["intersection"] = {"status": "ok", "matched_rows": int(len(matched_rows))}
 
+    run_report["steps"]["intersection"] = {"status": "ok", "matched_rows": int(len(matched_rows))}
     matched_df = pd.DataFrame(matched_rows)
 
-    # step 5 — scoring
     print("=== Scoring ===\n")
-    matched_df["tech_score"]       = matched_df.apply(technical_conviction_score, axis=1)
-    matched_df["funda_score"]      = matched_df.apply(score_fundamentals, axis=1)
-    matched_df["final_score"]      = (
-        WEIGHT_TECHNICAL   * matched_df["tech_score"] +
+    matched_df["tech_score"] = matched_df.apply(technical_conviction_score, axis=1)
+
+    funda_breakdown = matched_df.apply(
+        lambda row: pd.Series(get_fundamental_breakdown(row)),
+        axis=1
+    )
+    matched_df = pd.concat([matched_df, funda_breakdown], axis=1)
+
+    matched_df["final_score"] = (
+        WEIGHT_TECHNICAL * matched_df["tech_score"] +
         WEIGHT_FUNDAMENTAL * matched_df["funda_score"]
     ).round(4)
     matched_df["market_condition"] = market_condition
-    matched_df = matched_df.sort_values("final_score", ascending=False)
+
+    matched_df = matched_df.sort_values(
+        ["final_score", "match_confidence", "scanner_count"],
+        ascending=[False, False, False]
+    )
 
     tracked_cols = ["symbol", "stock_name", "scanner_count", "scanners", "priority"]
     tracked_cols = [c for c in tracked_cols if c in matched_df.columns]
@@ -327,46 +392,42 @@ def run_pipeline():
         index=False
     )
 
-    print("Top 15:")
-    display_cols = ["symbol", "stock_name", "final_score",
-                    "tech_score", "funda_score", "priority"]
+    display_cols = [
+        "symbol", "stock_name", "final_score", "tech_score", "funda_score",
+        "scanner_count", "priority", "match_method", "match_confidence"
+    ]
     display_cols = [c for c in display_cols if c in matched_df.columns]
+    print("Top 15:")
     print(matched_df[display_cols].head(15).to_string(index=False))
     run_report["steps"]["scoring"] = {"status": "ok", "ranked_rows": int(len(matched_df))}
 
-    # step 5a — sector enrichment and strength (post Chartink+Screener filter)
-    print("\n=== Sector Mapping & Strength ===\n")
+    print("\n=== Sector Mapping & Candidate Sector Snapshot ===\n")
     try:
         matched_df = enrich_with_sector_strength(matched_df)
-        if "sector" in matched_df.columns and "sector_strength_label" in matched_df.columns:
-            preview = matched_df[["symbol", "sector", "stock_perf_1m", "sector_strength", "sector_strength_label"]].head(15)
-            print(preview.to_string(index=False))
+        preview_cols = [
+            "symbol", "sector", "stock_perf_1m",
+            "candidate_sector_avg_1m",
+            "candidate_sector_vs_nifty500",
+            "candidate_sector_strength_label"
+        ]
+        preview_cols = [c for c in preview_cols if c in matched_df.columns]
+        if preview_cols:
+            print(matched_df[preview_cols].head(15).to_string(index=False))
         run_report["steps"]["sector_strength"] = {"status": "ok"}
     except Exception as e:
         run_report["steps"]["sector_strength"] = {"status": "error", "error": str(e)}
 
-    # step 5b — news analysis (web search via Groq compound)
     print()
     try:
         from news_analyzer import run_news_analysis
-        import json
         symbols_to_analyse = matched_df["symbol"].tolist()
-        ai_results         = run_news_analysis(symbols_to_analyse)
+        ai_results = run_news_analysis(symbols_to_analyse)
 
-        # Debug: check what we got back
-        print("\n  DEBUG — AI Results Summary:")
-        for sym, data in list(ai_results.items())[:3]:  # Show first 3
-            print(f"    {sym}: red_flags={data.get('red_flags', 'MISSING')[:50]}... catalysts={data.get('catalysts', 'MISSING')[:50]}...")
-        print(f"    Total symbols analyzed: {len(ai_results)}")
-
-        # Create ai_narrative with proper defaults and serialize to JSON
         def get_ai_data(symbol):
             symbol_str = str(symbol).strip().upper()
-            # Try exact match first, then case-insensitive
             if symbol_str in ai_results:
                 data = ai_results[symbol_str]
             else:
-                # Fallback search
                 data = None
                 for key in ai_results.keys():
                     if str(key).strip().upper() == symbol_str:
@@ -379,31 +440,14 @@ def run_pipeline():
                         "verdict": "Neutral"
                     }
             return json.dumps(data)
-        
-        matched_df["ai_narrative"] = matched_df["symbol"].apply(get_ai_data)
-        
-        # Debug: verify the data in the DataFrame
-        if len(matched_df) > 0:
-            first_sym = matched_df.iloc[0]["symbol"]
-            first_narrative = matched_df.iloc[0]["ai_narrative"]
-            print(f"\n  DEBUG — First row in DataFrame:")
-            print(f"    Symbol: {first_sym}")
-            print(f"    ai_narrative (raw): {first_narrative[:200]}")
-            # Try to parse it back
-            try:
-                parsed = json.loads(first_narrative)
-                print(f"    Parsed red_flags: {parsed.get('red_flags', 'MISSING')}")
-                print(f"    Parsed catalysts: {parsed.get('catalysts', 'MISSING')}")
-            except Exception as e:
-                print(f"    ✗ Failed to parse: {e}")
 
+        matched_df["ai_narrative"] = matched_df["symbol"].apply(get_ai_data)
     except Exception as e:
         print(f"  ⚠ AI analysis failed: {e}")
         print("  Continuing with placeholder AI data...")
-        # Create placeholder AI data for all stocks
         placeholder = json.dumps({
             "red_flags": "Analysis failed",
-            "catalysts": "Analysis failed", 
+            "catalysts": "Analysis failed",
             "verdict": "Neutral"
         })
         matched_df["ai_narrative"] = placeholder
@@ -411,9 +455,40 @@ def run_pipeline():
     else:
         run_report["steps"]["news_analysis"] = {"status": "ok"}
 
+    final_column_order = [
+        "symbol",
+        "stock_name",
+        "final_score",
+        "tech_score",
+        "funda_score",
+        "scanner_count",
+        "scanners",
+        "priority",
+        "market_condition",
+        "match_method",
+        "match_confidence",
+        "roe_component",
+        "roce_component",
+        "debt_component",
+        "promoter_component",
+        "growth_component",
+        "valuation_component",
+        "quarterly_trend_component",
+        "sector",
+        "stock_perf_1m",
+        "candidate_sector_avg_1m",
+        "nifty500_perf_1m",
+        "candidate_sector_vs_nifty500",
+        "candidate_sector_strength_label",
+        "ai_narrative",
+    ]
+
+    existing_cols = [c for c in final_column_order if c in matched_df.columns]
+    remaining_cols = [c for c in matched_df.columns if c not in existing_cols]
+    matched_df = matched_df[existing_cols + remaining_cols]
+
     matched_df.to_csv("output/final_ranked.csv", index=False)
 
-    # step 6 — notion push
     try:
         push_stats = push_to_notion(market_condition=market_condition, ranked_df=matched_df)
         run_report["steps"]["notion_push"] = {"status": "ok", "stats": push_stats or {}}
@@ -424,6 +499,7 @@ def run_pipeline():
     run_report["finished_at"] = datetime.now().isoformat()
     run_report["rows_final"] = int(len(matched_df))
     write_json("output/run_report.json", run_report)
+
     print(f"\n✓ Pipeline complete — {len(matched_df)} companies")
     print(f"  Market condition: {market_condition}")
     return run_report

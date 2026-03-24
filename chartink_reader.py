@@ -1,17 +1,19 @@
 import os
 import pandas as pd
-from config import CHARTINK_DIR, MIN_SCANNER_COUNT
+from config import CHARTINK_DIR
 
 SCANNERS = {
-    "stage2":         "stage2.csv",
-    "growthstocks":   "growthstocks.csv",
+    "stage2": "stage2.csv",
+    "growthstocks": "growthstocks.csv",
     "buying_urgency": "buying_urgency.csv",
 }
+
 
 def load_scanner(filepath):
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
     rename_map = {}
+
     for col in df.columns:
         col_lower = col.lower().strip()
         if "stock" in col_lower or "name" in col_lower:
@@ -24,15 +26,25 @@ def load_scanner(filepath):
             rename_map[col] = "pct_change"
         elif "volume" in col_lower:
             rename_map[col] = "volume"
+
     df = df.rename(columns=rename_map)
-    df["symbol"]     = df["symbol"].astype(str).str.strip()
+
+    if "symbol" not in df.columns or "stock_name" not in df.columns:
+        raise ValueError(f"Missing required columns in {filepath}")
+
+    if "close" not in df.columns:
+        df["close"] = None
+
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["stock_name"] = df["stock_name"].astype(str).str.strip()
+
     return df[["symbol", "stock_name", "close"]].copy()
+
 
 def read_chartink_exports():
     if not os.path.exists(CHARTINK_DIR):
         print(f"✗ Folder '{CHARTINK_DIR}' not found")
-        print(f"  Create it and put stage2.csv, growthstocks.csv, buying_urgency.csv inside")
+        print("  Create it and put stage2.csv, growthstocks.csv, buying_urgency.csv inside")
         return None
 
     loaded = {}
@@ -50,58 +62,62 @@ def read_chartink_exports():
         return None
 
     symbol_counts = {}
-    symbol_names  = {}
-    symbol_close  = {}
-    symbol_flags  = {}
+    symbol_names = {}
+    symbol_close = {}
+    symbol_flags = {}
 
     for scanner_name, df in loaded.items():
         for _, row in df.iterrows():
             sym = row["symbol"]
             if sym not in symbol_counts:
                 symbol_counts[sym] = 0
-                symbol_names[sym]  = row["stock_name"]
-                symbol_close[sym]  = row["close"]
-                symbol_flags[sym]  = []
+                symbol_names[sym] = row["stock_name"]
+                symbol_close[sym] = row["close"]
+                symbol_flags[sym] = []
             symbol_counts[sym] += 1
             symbol_flags[sym].append(scanner_name)
 
     rows = []
+
     for sym, count in symbol_counts.items():
-        if count >= 1:  # show all stocks, even those in just 1 scanner
-            scanners_str = " + ".join(symbol_flags[sym])
-            if count == 3:
-                priority = "A — all three scanners"
-            elif "stage2" in symbol_flags[sym] and "buying_urgency" in symbol_flags[sym]:
-                priority = "A — stage2 + institutions"
-            elif "stage2" in symbol_flags[sym] and "growthstocks" in symbol_flags[sym]:
-                priority = "B — stage2 + base"
-            elif "buying_urgency" in symbol_flags[sym] and "growthstocks" in symbol_flags[sym]:
-                priority = "B — institutions + base"
-            else:
-                priority = "C — other combination"
-            rows.append({
-                "symbol":        sym,
-                "stock_name":    symbol_names[sym],
-                "close":         symbol_close[sym],
-                "scanner_count": count,
-                "scanners":      scanners_str,
-                "priority":      priority,
-            })
+        scanners_str = " + ".join(symbol_flags[sym])
+
+        if count == 3:
+            priority = "A — all three scanners"
+        elif "stage2" in symbol_flags[sym] and "buying_urgency" in symbol_flags[sym]:
+            priority = "A — stage2 + institutions"
+        elif "stage2" in symbol_flags[sym] and "growthstocks" in symbol_flags[sym]:
+            priority = "B — stage2 + base"
+        elif "buying_urgency" in symbol_flags[sym] and "growthstocks" in symbol_flags[sym]:
+            priority = "B — institutions + base"
+        else:
+            priority = "C — single/other combination"
+
+        rows.append({
+            "symbol": sym,
+            "stock_name": symbol_names[sym],
+            "close": symbol_close[sym],
+            "scanner_count": count,
+            "scanners": scanners_str,
+            "priority": priority,
+        })
 
     if not rows:
-        print(f"\n  No stocks found in {MIN_SCANNER_COUNT}+ scanners")
+        print("\n  No stocks found in Chartink exports")
         return None
 
     result = pd.DataFrame(rows)
     result = result.sort_values(
-        ["scanner_count", "priority"],
-        ascending=[False, True]
+        ["scanner_count", "priority", "symbol"],
+        ascending=[False, True, True]
     ).reset_index(drop=True)
     return result
 
+
 def print_summary(df):
-    print(f"Total stocks in 2+ scanners: {len(df)}")
+    print(f"Total stocks in Chartink universe: {len(df)}")
     print()
+
     for priority in df["priority"].unique():
         subset = df[df["priority"] == priority]
         print(f"  {priority} ({len(subset)} stocks):")

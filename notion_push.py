@@ -9,17 +9,18 @@ from reliability_utils import write_json
 
 load_dotenv()
 
-NOTION_TOKEN       = os.getenv("NOTION_TOKEN")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 notion = Client(auth=NOTION_TOKEN)
 _DB_SCHEMA_CACHE = None
+_IPO_LOOKUP_CACHE = None
 
 
 def safe_float(val, decimals=2):
     try:
         return round(float(val), decimals)
-    except:
+    except Exception:
         return None
 
 
@@ -30,7 +31,6 @@ def safe_str(val):
 
 
 def parse_ai_narrative(narrative):
-    import json
     import ast
 
     if narrative is None or (isinstance(narrative, float) and pd.isna(narrative)):
@@ -45,7 +45,6 @@ def parse_ai_narrative(narrative):
 
     text = str(narrative).strip()
 
-    # Try JSON parsing
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -57,7 +56,6 @@ def parse_ai_narrative(narrative):
     except Exception:
         pass
 
-    # Try Python literal dict (as may be saved from dict string in CSV)
     try:
         data = ast.literal_eval(text)
         if isinstance(data, dict):
@@ -69,10 +67,9 @@ def parse_ai_narrative(narrative):
     except Exception:
         pass
 
-    # Fallback parse manually from simple text
     red_flags = "None"
     catalysts = "None"
-    verdict   = "Neutral"
+    verdict = "Neutral"
 
     for line in text.split("\n"):
         line = line.strip()
@@ -144,20 +141,34 @@ def safe_select_property(properties, prop_name, requested, fallback="Unknown"):
     properties[prop_name] = {"select": {"name": value}}
 
 
-def get_ipo_label(row):
+def _get_ipo_lookup():
+    global _IPO_LOOKUP_CACHE
+    if _IPO_LOOKUP_CACHE is not None:
+        return _IPO_LOOKUP_CACHE
+
     ipo_path = "output/ipo_lookup.csv"
+    if not os.path.exists(ipo_path):
+        _IPO_LOOKUP_CACHE = None
+        return None
+
     try:
-        if not os.path.exists(ipo_path):
+        _IPO_LOOKUP_CACHE = pd.read_csv(ipo_path)
+    except Exception:
+        _IPO_LOOKUP_CACHE = None
+    return _IPO_LOOKUP_CACHE
+
+
+def get_ipo_label(row):
+    ipo_df = _get_ipo_lookup()
+    try:
+        if ipo_df is None or ipo_df.empty:
             return "—"
 
-        ipo_df     = pd.read_csv(ipo_path)
         stock_name = safe_str(row.get("stock_name", ""))
         if not stock_name:
             return "—"
 
-        # stop words — too generic to match on
-        stop = {"ltd", "limited", "india", "indian", "and", "of",
-                "the", "co", "corp", "corporation"}
+        stop = {"ltd", "limited", "india", "indian", "and", "of", "the", "co", "corp", "corporation"}
 
         def sig_words(name):
             words = str(name).lower().replace(".", "").replace("-", " ").split()
@@ -171,34 +182,31 @@ def get_ipo_label(row):
             ipo_sig = sig_words(ipo_row["company_name"])
             if not ipo_sig:
                 continue
-            # first significant word must match exactly
             if stock_sig[0] != ipo_sig[0]:
                 continue
-            # if both have 2 words, second must also match
-            if len(stock_sig) >= 2 and len(ipo_sig) >= 2:
-                if stock_sig[1] != ipo_sig[1]:
-                    continue
+            if len(stock_sig) >= 2 and len(ipo_sig) >= 2 and stock_sig[1] != ipo_sig[1]:
+                continue
+
             qib = ipo_row["qib_subscription"]
             if qib > 25:
                 return f"High QIB ({round(float(qib), 1)}x)"
-
     except Exception:
         pass
     return "—"
 
 
 def build_fundamentals(row):
-    roe      = safe_float(row.get("ROE%"))
-    roce     = safe_float(row.get("ROCE%"))
-    de       = safe_float(row.get("Debt / Eq"))
+    roe = safe_float(row.get("ROE%"))
+    roce = safe_float(row.get("ROCE%"))
+    de = safe_float(row.get("Debt / Eq"))
     promoter = safe_float(row.get("Prom. Hold.%"))
-    pe       = safe_float(row.get("P/E"))
-    ind_pe   = safe_float(row.get("Ind PE"))
-    sales_g  = safe_float(row.get("Sales growth %"))
+    pe = safe_float(row.get("P/E"))
+    ind_pe = safe_float(row.get("Ind PE"))
+    sales_g = safe_float(row.get("Sales growth %"))
     profit_g = safe_float(row.get("Profit growth %"))
-    int_cov  = safe_float(row.get("Int Coverage"))
-    cfo      = safe_float(row.get("CF Operations Rs.Cr."))
-    mar_cap  = safe_float(row.get("Mar Cap Rs.Cr."))
+    int_cov = safe_float(row.get("Int Coverage"))
+    cfo = safe_float(row.get("CF Operations Rs.Cr."))
+    mar_cap = safe_float(row.get("Mar Cap Rs.Cr."))
 
     q1 = safe_float(row.get("Sales Qtr Rs.Cr."))
     q2 = safe_float(row.get("Sales 2Qtr Bk Rs.Cr."))
@@ -218,7 +226,20 @@ def build_fundamentals(row):
     else:
         trend = "— Data unavailable"
 
-    lines = [
+    explain_lines = [
+        "=== SCORE BREAKDOWN ===",
+        f"Tech score              : {safe_float(row.get('tech_score'), 4)}",
+        f"Funda score             : {safe_float(row.get('funda_score'), 4)}",
+        f"ROE component           : {safe_float(row.get('roe_component'), 4)}",
+        f"ROCE component          : {safe_float(row.get('roce_component'), 4)}",
+        f"Debt component          : {safe_float(row.get('debt_component'), 4)}",
+        f"Promoter component      : {safe_float(row.get('promoter_component'), 4)}",
+        f"Growth component        : {safe_float(row.get('growth_component'), 4)}",
+        f"Valuation component     : {safe_float(row.get('valuation_component'), 4)}",
+        f"Quarterly trend comp.   : {safe_float(row.get('quarterly_trend_component'), 4)}",
+        f"Match method            : {safe_str(row.get('match_method', ''))}",
+        f"Match confidence        : {safe_float(row.get('match_confidence'), 2)}",
+        "",
         "=== PROFITABILITY ===",
         f"ROE          : {roe}%",
         f"ROCE         : {roce}%",
@@ -246,58 +267,53 @@ def build_fundamentals(row):
         f"Market Cap   : Rs.{mar_cap} Cr",
         f"OCF          : Rs.{cfo} Cr",
     ]
-    return "\n".join(str(l) for l in lines)
+    return "\n".join(str(l) for l in explain_lines)
 
 
 def is_ai_analysis_available(analysis_dict):
-    """Check if AI analysis contains real data vs error messages"""
     if not analysis_dict or not isinstance(analysis_dict, dict):
         return False
-        
+
     bad_indicators = [
         "Analysis unavailable",
-        "No data available", 
+        "No data available",
         "Error",
         "Failed",
         "Token expired",
         "API error"
     ]
-    
+
     red_flags = str(analysis_dict.get("red_flags", "")).lower().strip()
     catalysts = str(analysis_dict.get("catalysts", "")).lower().strip()
-    
-    # Check if any field indicates an error
+
     if any(indicator.lower() in red_flags for indicator in bad_indicators) or \
        any(indicator.lower() in catalysts for indicator in bad_indicators):
         return False
-        
-    # Check if we have at least some meaningful content
-    return not (red_flags in ["none", ""] and 
-                catalysts in ["none", ""] and 
-                str(analysis_dict.get("verdict", "")).lower().strip() == "neutral")
+
+    return not (
+        red_flags in ["none", ""] and
+        catalysts in ["none", ""] and
+        str(analysis_dict.get("verdict", "")).lower().strip() == "neutral"
+    )
 
 
 def push_company(row, scan_date):
-    name     = safe_str(row.get("stock_name", "Unknown"))
-    symbol   = safe_str(row.get("symbol", ""))
-    score    = safe_float(row.get("final_score", 0), 4) or 0
-    market   = safe_str(row.get("market_condition", "UNKNOWN"))
-    title    = f"{symbol} — {name}"
+    name = safe_str(row.get("stock_name", "Unknown"))
+    symbol = safe_str(row.get("symbol", ""))
+    score = safe_float(row.get("final_score", 0), 4) or 0
+    market = safe_str(row.get("market_condition", "UNKNOWN"))
+    title = f"{symbol} — {name}"
 
     screen_label = build_screen_label(row)[:100]
-    ipo_label    = get_ipo_label(row)
+    ipo_label = get_ipo_label(row)
 
-    red_flags, catalysts, verdict = parse_ai_narrative(
-        row.get("ai_narrative", {})
-    )
+    red_flags, catalysts, verdict = parse_ai_narrative(row.get("ai_narrative", {}))
 
-    # Determine whether AI data is usable; if not, skip AI properties so existing row values stay as-is
     ai_data = row.get("ai_narrative", {})
     if isinstance(ai_data, str):
         try:
-            import json
             ai_data = json.loads(ai_data)
-        except:
+        except Exception:
             ai_data = {}
 
     ai_available = is_ai_analysis_available(ai_data)
@@ -312,10 +328,10 @@ def push_company(row, scan_date):
 
     fundamentals = build_fundamentals(row)
     sector = safe_str(row.get("sector", "Unknown")) or "Unknown"
-    sector_strength_label = safe_str(row.get("sector_strength_label", "Flat")) or "Flat"
-    sector_strength_value = safe_float(row.get("sector_strength", 0), 2)
+    sector_strength_label = safe_str(row.get("candidate_sector_strength_label", "Flat")) or "Flat"
+    candidate_sector_avg_1m = safe_float(row.get("candidate_sector_avg_1m", 0), 2)
     nifty500_perf_1m = safe_float(row.get("nifty500_perf_1m", 0), 2)
-    sector_vs_nifty500 = safe_float(row.get("sector_vs_nifty500", 0), 2)
+    candidate_sector_vs_nifty500 = safe_float(row.get("candidate_sector_vs_nifty500", 0), 2)
 
     existing = notion_retry(lambda: notion.databases.query(
         database_id=NOTION_DATABASE_ID,
@@ -348,14 +364,15 @@ def push_company(row, scan_date):
             "rich_text": [{
                 "text": {
                     "content": (
-                        f"Sector 1M avg: {sector_strength_value}% | "
+                        f"Candidate sector avg 1M: {candidate_sector_avg_1m}% | "
                         f"Nifty500 1M: {nifty500_perf_1m}% | "
-                        f"Alpha vs Nifty500: {sector_vs_nifty500}%"
+                        f"Candidate sector alpha vs Nifty500: {candidate_sector_vs_nifty500}%"
                     )
                 }
             }]
         },
     }
+
     safe_select_property(properties, "Screen", screen_label, fallback="—")
     safe_select_property(properties, "Sector", sector[:100], fallback="Unknown")
     safe_select_property(properties, "Sector Strength", sector_strength_label[:100], fallback="Slightly Weak vs Nifty500")
@@ -363,16 +380,12 @@ def push_company(row, scan_date):
     safe_select_property(properties, "IPO", ipo_label[:100], fallback="—")
     safe_select_property(properties, "Status", "To Review", fallback="To Review")
 
-    # Preserve previous AI fields on update if no new valid AI output
     if ai_available:
         properties["Red Flags"] = {
             "rich_text": [{"text": {"content": red_flags[:2000]}}]
         }
         properties["Catalysts"] = {
             "rich_text": [{"text": {"content": catalysts[:2000]}}]
-        }
-        properties["Verdict"] = {
-            "select": {"name": verdict_clean}
         }
         safe_select_property(properties, "Verdict", verdict_clean, fallback="Neutral")
 
@@ -401,20 +414,20 @@ def push_to_notion(market_condition="UNKNOWN", ranked_df=None):
 
     total_created = 0
     total_updated = 0
-    total_failed  = 0
+    total_failed = 0
     failures = []
 
     for _, row in ranked_df.iterrows():
         symbol = safe_str(row.get("symbol", "Unknown"))
         try:
             result = push_company(row, scan_date)
-            icon   = "✓" if result == "created" else "↺"
+            icon = "✓" if result == "created" else "↺"
             if result == "created":
                 total_created += 1
             else:
                 total_updated += 1
             score = safe_float(row.get("final_score", 0), 4) or 0
-            print(f"  {icon} {symbol:12} score: {round(score*100,1)}%")
+            print(f"  {icon} {symbol:12} score: {round(score * 100, 1)}%")
         except Exception as e:
             print(f"  ✗ {symbol} — {e}")
             total_failed += 1
@@ -426,7 +439,7 @@ def push_to_notion(market_condition="UNKNOWN", ranked_df=None):
     print(f"  Updated : {total_updated}")
     print(f"  Failed  : {total_failed}")
     print("─" * 40)
-    print(f"\n✓ Open Notion → Trading Candidates to review")
+    print("\n✓ Open Notion → Trading Candidates to review")
 
     stats = {
         "created": total_created,
@@ -444,21 +457,26 @@ def retry_failed_from_last_run(market_condition="UNKNOWN", source_csv="output/fi
     if not os.path.exists(path):
         print("✗ No previous Notion run report found.")
         return None
+
     with open(path, "r") as f:
         data = json.load(f)
+
     failed_rows = data.get("failed_rows", [])
     if not failed_rows:
         print("✓ No failed Notion rows to retry.")
         return {"retried": 0, "failed": 0}
+
     failed_symbols = {str(x.get("symbol", "")).strip().upper() for x in failed_rows}
     if not os.path.exists(source_csv):
         print(f"✗ Source CSV missing: {source_csv}")
         return None
+
     ranked_df = pd.read_csv(source_csv)
     retry_df = ranked_df[ranked_df["symbol"].astype(str).str.upper().isin(failed_symbols)].copy()
     if retry_df.empty:
         print("✗ No matching symbols found for retry.")
         return None
+
     print(f"Retrying {len(retry_df)} failed symbols...")
     return push_to_notion(market_condition=market_condition, ranked_df=retry_df)
 
@@ -468,6 +486,6 @@ if __name__ == "__main__":
     try:
         with open("output/market_condition.txt", "r") as f:
             market_condition = f.read().strip()
-    except:
+    except Exception:
         pass
     push_to_notion(market_condition=market_condition)
